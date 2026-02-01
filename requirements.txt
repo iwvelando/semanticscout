@@ -1,0 +1,26 @@
+# Semantic Scout Dependencies
+# Install with: pip install -r requirements.txt
+
+# Web Scraping
+playwright>=1.40.0
+
+# Geocoding
+geopy>=2.4.1
+
+# HTTP Client (for Ollama API)
+httpx>=0.25.0
+
+# Configuration
+PyYAML>=6.0.1
+
+# Async support (included in Python 3.11+, but good to have)
+asyncio-throttle>=1.0.2
+
+# Optional: for better async handling
+aiofiles>=23.2.1
+
+# Development dependencies (optional)
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0
+# mypy>=1.0.0

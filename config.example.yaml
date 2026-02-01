@@ -1,0 +1,118 @@
+# Semantic Scout Configuration
+# Copy this file to config.yaml and customize for your needs.
+
+# LLM Configuration (via Ollama)
+llm:
+  model: "llama3.1:8b"  # Model optimized for 8GB VRAM
+  base_url: "http://localhost:11434"
+  timeout: 120  # seconds
+  temperature: 0.3
+  max_tokens: 500  # Output token limit (num_predict) - 500 is plenty for JSON response
+  context_window: 8192  # Total context window (num_ctx) for input + output
+                        # Higher values allow longer job descriptions but use more VRAM
+                        # GTX 1080 (8GB) can comfortably handle 8192-16384
+
+# Geographic Targeting
+#
+# Supports multiple target cities for users considering relocation.
+# Jobs are matched if they fall within ANY city's radius.
+# Reports will show which city each job matched.
+#
+# Special behaviors:
+# - include_remote: If true, remote jobs always pass the filter
+# - Empty cities section: Disables geo filtering (user open to anywhere)
+#   but include_remote is still honored
+#
+location:
+  include_remote: true  # Include remote positions
+  
+  # Define one or more target cities (stanza names can be anything)
+  # Comment out all city stanzas to disable geo filtering (open to anywhere)
+  
+  nyc:  # Example: New York City area
+    target_latitude: 40.7128
+    target_longitude: -74.0060
+    radius_miles: 25.0
+  
+  # Add more cities if considering relocation:
+  # chicago:
+  #   target_latitude: 41.8781
+  #   target_longitude: -87.6298
+  #   radius_miles: 30.0
+  #
+  # austin:
+  #   target_latitude: 30.2672
+  #   target_longitude: -97.7431
+  #   radius_miles: 20.0
+  
+  # LLM-based geocoding fallback for ambiguous locations like "Dallas-Fort Worth Metroplex"
+  # or "Hybrid work in New York, NY 10172". When enabled, if traditional geocoding fails,
+  # the LLM is queried multiple times and only used if there's consensus agreement.
+  llm_geocode_fallback: true  # Use LLM to resolve ambiguous location strings
+  llm_geocode_queries: 5  # Number of LLM queries for consensus voting
+  llm_geocode_min_agreement: 3  # Minimum matching responses needed (out of llm_geocode_queries)
+
+# Job Search Parameters
+search:
+  keywords:
+    - "Senior DevOps Engineer"
+    - "Platform Engineer"
+    - "Site Reliability Engineer"
+    - "Infrastructure Engineer"
+    - "Cloud Architect"
+    - "DevOps Manager"
+    - "Kubernetes Engineer"
+  job_boards:
+    - "linkedin"
+    - "indeed"
+  max_results_per_keyword: 50
+  job_goal_statement: |
+    Seeking a senior DevOps or Platform Engineering role with strong focus on
+    Kubernetes, cloud infrastructure (AWS/GCP), and CI/CD automation. Ideal position
+    involves designing scalable infrastructure, implementing GitOps workflows, and
+    leading platform teams. Prefer roles balancing hands-on technical work with
+    architectural decision-making and mentorship opportunities.
+
+# Database Settings
+database:
+  db_path: "jobs.db"
+
+# Reporting Settings
+reporting:
+  output_dir: "reports"
+  min_score_threshold: 7.0  # Only include jobs scoring above this
+  include_job_descriptions: true
+  save_to_file: true  # Save reports to local files in output_dir
+  
+  # Slack Integration (optional)
+  # You can use EITHER webhook_url OR bot_token+channel_id
+  slack:
+    enabled: false
+    
+    # Option 1: Webhook (simple, summary message with top 5 jobs inline)
+    # Create at: https://api.slack.com/apps -> Incoming Webhooks
+    # webhook_url: "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+    
+    # Option 2: Bot Token (threaded messages with all jobs)
+    # Posts a summary message, then threaded replies with job batches
+    # Required scope: chat:write
+    # Get from: https://api.slack.com/apps -> OAuth & Permissions
+    # bot_token: "xoxb-your-bot-token"
+    # channel_id: "C0123456789"  # Right-click channel -> View channel details -> Copy ID
+    
+    # Message options
+    mention_users: []  # List of Slack user IDs to @mention (e.g., ["U0123456789"])
+    jobs_per_thread: 5  # Number of jobs per threaded reply
+
+# Web Scraper Settings
+scraper:
+  headless: true
+  timeout: 30
+  max_concurrent_requests: 5
+  retry_attempts: 3
+  retry_delay: 2.0
+  parallel_boards: true  # If true, search different job boards in parallel
+  
+  # Indeed-specific settings
+  # Indeed is aggressive with bot detection - longer delays help avoid captchas
+  indeed_page_delay: 10.0  # Seconds to wait between Indeed pagination requests
