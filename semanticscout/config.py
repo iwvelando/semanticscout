@@ -111,6 +111,15 @@ class ReportingConfig:
 
 
 @dataclass
+class DeduplicationConfig:
+    """Cross-source job deduplication configuration."""
+    enabled: bool = True
+    similarity_threshold: float = 0.92  # Cosine similarity threshold for duplicates
+                                         # Higher = stricter (fewer false positives)
+                                         # 0.92 is a good balance for job listings
+
+
+@dataclass
 class ScraperConfig:
     """Web scraper configuration."""
     headless: bool = True
@@ -134,6 +143,7 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     reporting: ReportingConfig = field(default_factory=ReportingConfig)
+    deduplication: DeduplicationConfig = field(default_factory=DeduplicationConfig)
     scraper: ScraperConfig = field(default_factory=ScraperConfig)
 
     def validate(self) -> list[str]:
@@ -302,6 +312,16 @@ def load_config(config_path: Optional[str] = None) -> Config:
             ),
             save_to_file=report_data.get("save_to_file", config.reporting.save_to_file),
             slack=slack_config,
+        )
+    
+    # Load deduplication config
+    if "deduplication" in raw_config:
+        dedup_data = raw_config["deduplication"]
+        config.deduplication = DeduplicationConfig(
+            enabled=dedup_data.get("enabled", config.deduplication.enabled),
+            similarity_threshold=dedup_data.get(
+                "similarity_threshold", config.deduplication.similarity_threshold
+            ),
         )
     
     # Load scraper config

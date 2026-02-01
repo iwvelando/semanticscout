@@ -65,6 +65,8 @@ search:
   job_boards:
     - "linkedin"
     - "indeed"
+    - "dice"      # Tech-focused job board
+    - "builtin"   # Startup/tech job board
   max_results_per_keyword: 50
   job_goal_statement: |
     Seeking a senior DevOps or Platform Engineering role with strong focus on
@@ -72,6 +74,15 @@ search:
     involves designing scalable infrastructure, implementing GitOps workflows, and
     leading platform teams. Prefer roles balancing hands-on technical work with
     architectural decision-making and mentorship opportunities.
+
+# Deduplication Settings
+# Cross-source deduplication using embedding similarity
+deduplication:
+  enabled: true
+  similarity_threshold: 0.92  # Cosine similarity threshold (0.0-1.0)
+                               # Higher = stricter matching (fewer false positives)
+                               # Lower = catches more variations (fewer false negatives)
+                               # 0.92 is a good balance for job listings
 
 # Database Settings
 database:

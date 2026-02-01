@@ -6,18 +6,29 @@ A Python-based automation pipeline that scrapes job listings, filters them by ge
 
 ## Features
 
-- 🔍 **Multi-source Job Collection**: Scrapes jobs from LinkedIn, Indeed, and other job boards
-- 🗺️ **Geographic Filtering**: Filter jobs by distance from your target location (with remote job detection)
+- 🔍 **Multi-source Job Collection**: Scrapes jobs from LinkedIn, Indeed, Dice, and Built In
+- 🗺️ **Multi-City Geographic Filtering**: Filter jobs by distance from multiple target cities (great for relocation consideration)
+- 🔄 **Smart Cross-Source Deduplication**: Embedding-based duplicate detection across job boards
 - 🤖 **AI-Powered Scoring**: Uses local LLM via Ollama to score job relevance (1-10 scale)
 - 💾 **Persistent Storage**: SQLite database for tracking jobs and preventing duplicates
 - 📊 **Automated Reporting**: Daily markdown summaries of high-scoring opportunities
+- 💬 **Slack Integration**: Post reports to Slack with threaded job details
 - 📈 **Application Tracking**: Track your application status for each job
+
+## Supported Job Boards
+
+| Board | Status | Notes |
+|-------|--------|-------|
+| **LinkedIn** | ✅ Full support | Full job descriptions |
+| **Indeed** | ✅ Snippets only | Indeed blocks headless browsers |
+| **Dice** | ✅ Full support | Tech-focused job board |
+| **Built In** | ✅ Full support | Startup/tech job board |
 
 ## Requirements
 
 - Python 3.11+
-- Ubuntu 24.04 (Server) or similar Linux distribution
-- NVIDIA GPU with 8GB+ VRAM (for local LLM inference)
+- Ubuntu 24.04 (Server) or macOS (also works on Linux)
+- NVIDIA GPU with 8GB+ VRAM (for local LLM inference and embeddings)
 - [Ollama](https://ollama.ai/) installed and running
 - Playwright browsers installed
 
@@ -130,10 +141,30 @@ llm:
 
 ```yaml
 location:
-  target_latitude: 40.7128  # Your latitude
-  target_longitude: -74.0060  # Your longitude
-  radius_miles: 10.0  # Search radius
   include_remote: true  # Include remote jobs
+  
+  # Define multiple target cities (for relocation consideration)
+  nyc:
+    target_latitude: 40.7128
+    target_longitude: -74.0060
+    radius_miles: 25.0
+  
+  chicago:
+    target_latitude: 41.8781
+    target_longitude: -87.6298
+    radius_miles: 30.0
+  
+  # LLM-based geocoding for ambiguous locations
+  llm_geocode_fallback: true
+```
+
+### Deduplication Settings
+
+```yaml
+deduplication:
+  enabled: true
+  similarity_threshold: 0.92  # Cosine similarity (0.0-1.0)
+                               # Higher = stricter matching
 ```
 
 ### Search Keywords
@@ -141,9 +172,14 @@ location:
 ```yaml
 search:
   keywords:
-    - "Workday Manager"
-    - "HRIS Integration Architect"
-    - "Workday Studio Specialist"
+    - "Senior DevOps Engineer"
+    - "Platform Engineer"
+    - "Site Reliability Engineer"
+  job_boards:
+    - "linkedin"
+    - "indeed"
+    - "dice"
+    - "builtin"
   job_goal_statement: |
     Your detailed job goal statement here...
 ```
@@ -160,14 +196,35 @@ semanticscout/
 ├── reports/                  # Generated reports
 │   ├── daily_report_YYYY-MM-DD.md
 │   └── weekly_summary_YYYY-MM-DD.md
+├── test_scripts/             # Testing utilities
+│   └── test_slack.py         # Slack integration tester
 └── semanticscout/            # Core modules
     ├── __init__.py
     ├── config.py             # Configuration management
     ├── database.py           # SQLite database layer
-    ├── collector.py          # Job scraping (LinkedIn, Indeed)
-    ├── geofence.py           # Geographic filtering
+    ├── collector.py          # Job scraping (LinkedIn, Indeed, Dice, Built In)
+    ├── geofence.py           # Geographic filtering (multi-city support)
+    ├── deduplicator.py       # Embedding-based cross-source deduplication
     ├── scorer.py             # LLM-based semantic scoring
-    └── reporting.py          # Report generation
+    └── reporting.py          # Report generation (file + Slack)
+```
+
+## Deduplication
+
+Semantic Scout uses a two-tier deduplication strategy:
+
+1. **Exact Hash Match**: Same job from same source (identical URL)
+2. **Embedding Similarity**: Cross-source duplicates detected using sentence-transformers
+
+The embedding-based approach catches the same job posted on multiple boards (e.g., LinkedIn AND Indeed) by computing semantic similarity of `title | company | location` signatures.
+
+When a cross-source duplicate is detected, the log shows:
+```
+DUPLICATE DETECTED (similarity=0.947):
+  NEW: https://www.indeed.com/viewjob?jk=abc123
+       -> "senior devops engineer | acme corp | new york ny"
+  EXISTING (id=42): https://www.linkedin.com/jobs/view/123456
+       -> "senior devops engineer | acme corporation | new york, ny"
 ```
 
 ## Scoring System
@@ -259,3 +316,4 @@ MIT License - See LICENSE file for details.
 - [Ollama](https://ollama.ai/) for local LLM inference
 - [Playwright](https://playwright.dev/) for web scraping
 - [geopy](https://geopy.readthedocs.io/) for geocoding
+- [sentence-transformers](https://www.sbert.net/) for embedding-based deduplication

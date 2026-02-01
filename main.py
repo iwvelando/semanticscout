@@ -20,6 +20,7 @@ from semanticscout.collector import CollectorManager, RawJobListing, raw_to_job
 from semanticscout.geofence import Geofencer
 from semanticscout.scorer import ScorerManager
 from semanticscout.reporting import ReportGenerator
+from semanticscout.deduplicator import JobDeduplicator
 
 
 # Configure logging
@@ -69,6 +70,13 @@ class SemanticScoutPipeline:
         self.collector_manager = CollectorManager(config.scraper)
         self.scorer_manager = ScorerManager(config.llm, config.search)
         self.reporter = ReportGenerator(config.reporting, self.db)
+        
+        # Initialize deduplicator if enabled
+        self.deduplicator = None
+        if config.deduplication.enabled:
+            self.deduplicator = JobDeduplicator(
+                similarity_threshold=config.deduplication.similarity_threshold
+            )
         
         logger.info("Semantic Scout pipeline initialized")
     
@@ -122,19 +130,66 @@ class SemanticScoutPipeline:
             logger.info("=" * 60)
             
             new_jobs = []
+            duplicate_count = 0
+            cross_source_dupe_count = 0
+            
+            # Load existing jobs once for deduplication
+            # Tuple format: (id, title, company, location, description, url)
+            existing_jobs_list = self.db.get_all_jobs(limit=10000)
+            existing_tuples = [
+                (j.id, j.title, j.company, j.location, j.description or "", j.url)
+                for j in existing_jobs_list if j.id
+            ]
+            
+            # Warm up deduplicator cache with existing jobs if enabled
+            if self.deduplicator and existing_tuples:
+                logger.info(f"Pre-loading {len(existing_tuples)} existing jobs into deduplicator cache")
+                self.deduplicator.batch_compute_embeddings([
+                    (j[0], j[1], j[2], j[3], j[4])  # id, title, company, location, description
+                    for j in existing_tuples
+                ])
+            
             for raw in raw_jobs:
                 job = raw_to_job(raw)
                 
-                if not self.db.job_exists(job.job_hash):
-                    job = await self.geofencer.enrich_job_location(job)
-                    job_id = self.db.insert_job(job)
+                # First: Check exact hash (same URL from same source)
+                if self.db.job_exists(job.job_hash):
+                    duplicate_count += 1
+                    continue
+                
+                # Second: Check embedding similarity (cross-source duplicates)
+                if self.deduplicator and existing_tuples:
+                    dup_result = self.deduplicator.check_duplicate(
+                        job.title, job.company, job.location, job.description or "", job.url,
+                        existing_tuples
+                    )
                     
-                    if job_id:
-                        job.id = job_id
-                        new_jobs.append(job)
+                    if dup_result.is_duplicate:
+                        cross_source_dupe_count += 1
+                        # Log is handled inside check_duplicate()
+                        continue
+                
+                # Not a duplicate - enrich and store
+                job = await self.geofencer.enrich_job_location(job)
+                job_id = self.db.insert_job(job)
+                
+                if job_id:
+                    job.id = job_id
+                    new_jobs.append(job)
+                    
+                    # Add new job to existing_tuples for dedup against remaining raw jobs
+                    existing_tuples.append(
+                        (job_id, job.title, job.company, job.location, job.description or "", job.url)
+                    )
             
             stats["jobs_new"] = len(new_jobs)
-            logger.info(f"Found {len(new_jobs)} new unique jobs")
+            stats["jobs_duplicate_exact"] = duplicate_count
+            stats["jobs_duplicate_cross_source"] = cross_source_dupe_count
+            logger.info(
+                f"Found {len(new_jobs)} new unique jobs "
+                f"(skipped: {duplicate_count} exact duplicates, "
+                f"{cross_source_dupe_count} cross-source duplicates)"
+            )
             
             # Step 3: Apply geographic filter
             logger.info("=" * 60)

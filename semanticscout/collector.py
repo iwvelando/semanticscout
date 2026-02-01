@@ -584,7 +584,6 @@ class IndeedCollector(JobCollector):
                         href = await link_elem.get_attribute("href")
                         if href:
                             # Extract job key from redirect URL
-                            import re
                             jk_match = re.search(r'jk=([a-f0-9]+)', href)
                             if jk_match:
                                 job_key = jk_match.group(1)
@@ -644,6 +643,645 @@ class IndeedCollector(JobCollector):
         pass
 
 
+class DiceCollector(JobCollector):
+    """Collector for Dice job listings (tech-focused job board)."""
+    
+    BASE_URL = "https://www.dice.com/jobs"
+    
+    def __init__(self, browser: Browser, config: ScraperConfig):
+        self.browser = browser
+        self.config = config
+        self.source = "dice"
+    
+    async def search(self, keyword: str, max_results: int = 50) -> list[RawJobListing]:
+        """
+        Search Dice for jobs matching the keyword.
+        
+        Args:
+            keyword: Search keyword.
+            max_results: Maximum number of results to fetch.
+        
+        Returns:
+            List of raw job listings.
+        """
+        jobs = []
+        context = await self.browser.new_context(
+            user_agent=self.config.user_agent,
+            viewport={"width": 1920, "height": 1080}
+        )
+        
+        try:
+            page = await context.new_page()
+            
+            # Build search URL - Dice updated their URL structure
+            search_url = f"https://www.dice.com/jobs?q={quote_plus(keyword)}&location=United%20States&countryCode=US&page=1&pageSize=50"
+            logger.info(f"Dice search URL: {search_url}")
+            
+            await page.goto(search_url, timeout=self.config.timeout * 1000)
+            await page.wait_for_load_state("networkidle", timeout=self.config.timeout * 1000)
+            
+            # Give React/Vue app time to render
+            await asyncio.sleep(3)
+            
+            # Dice uses a variety of selectors - try multiple
+            # From HTML inspection: div[role="listitem"] > ... > div[data-testid="job-card"]
+            card_selectors = [
+                'div[data-testid="job-card"]',  # Primary: actual card container
+                'div[role="article"]',  # The job-card also has role="article"
+                'div[role="listitem"]',  # Parent container that wraps the full card
+                'dhi-search-card',  # Web component (older Dice)
+                '[data-testid="job-search-result"]',
+                '[data-cy="search-result-job-card"]',
+            ]
+            
+            job_cards = []
+            used_selector = None
+            for selector in card_selectors:
+                job_cards = await page.query_selector_all(selector)
+                if job_cards:
+                    used_selector = selector
+                    logger.debug(f"Dice: Found {len(job_cards)} cards with selector: {selector}")
+                    break
+            
+            # If no cards found with proper selectors, try finding job links and navigate to parent
+            if not job_cards:
+                logger.debug("Dice: No cards found with standard selectors, trying link-based fallback")
+                job_links = await page.query_selector_all('a[data-testid="job-search-job-detail-link"]')
+                if not job_links:
+                    job_links = await page.query_selector_all('a[href*="/job-detail/"]')
+                
+                if job_links:
+                    logger.debug(f"Dice: Found {len(job_links)} job links, navigating to parent cards")
+                    # Navigate each link to its parent card (div[data-testid="job-card"] or similar)
+                    seen_cards = set()
+                    for link in job_links:
+                        try:
+                            # Navigate up to find the card container
+                            parent_card = await link.evaluate_handle("""
+                                el => {
+                                    let parent = el;
+                                    while (parent && parent.parentElement) {
+                                        parent = parent.parentElement;
+                                        if (parent.getAttribute && 
+                                            (parent.getAttribute('data-testid') === 'job-card' ||
+                                             parent.getAttribute('role') === 'article' ||
+                                             parent.getAttribute('data-job-guid'))) {
+                                            return parent;
+                                        }
+                                    }
+                                    return null;
+                                }
+                            """)
+                            if parent_card:
+                                # Use data-job-guid as unique identifier to avoid duplicates
+                                card_id = await parent_card.evaluate("el => el.getAttribute('data-job-guid') || el.getAttribute('data-id') || ''")
+                                if card_id and card_id not in seen_cards:
+                                    seen_cards.add(card_id)
+                                    job_cards.append(parent_card)
+                        except Exception as e:
+                            logger.debug(f"Dice: Error navigating to parent card: {e}")
+                    
+                    if job_cards:
+                        used_selector = "link->parent navigation"
+                        logger.debug(f"Dice: Found {len(job_cards)} unique parent cards via navigation")
+            
+            if not job_cards:
+                # Debug: log what we see on the page
+                title = await page.title()
+                logger.warning(f"Dice job list not found. Page title: {title}")
+                
+                # Check if there's a "no results" message
+                no_results = await page.query_selector('[class*="no-results"], [class*="NoResults"]')
+                if no_results:
+                    logger.info("Dice returned no results for this search")
+                    return jobs
+                
+                # Log page HTML snippet for debugging (first 1000 chars of body)
+                body = await page.query_selector('body')
+                if body:
+                    html = await body.inner_html()
+                    logger.debug(f"Dice page body preview: {html[:1000]}...")
+                
+                return jobs
+            
+            total_cards = len(job_cards)
+            cards_to_process = job_cards[:max_results]
+            logger.info(f"Found {total_cards} job cards on Dice, processing up to {len(cards_to_process)}")
+            
+            for card in cards_to_process:
+                try:
+                    job = await self._extract_job_from_card(card, page)
+                    if job:
+                        jobs.append(job)
+                except Exception as e:
+                    logger.error(f"Error extracting Dice job: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Dice search error: {e}")
+        finally:
+            await context.close()
+        
+        return jobs
+    
+    async def _extract_job_from_card(self, card, page: Page) -> Optional[RawJobListing]:
+        """Extract job data from a Dice job card."""
+        try:
+            # From HTML inspection, the title link has class "text-xl font-semibold text-zinc-800"
+            # There are 3 links with /job-detail/: invisible overlay, Easy Apply button, and the actual title
+            # We need to target the title specifically by its styling class
+            title_selectors = [
+                # Primary: title link has text-xl class (from HTML inspection)
+                'a.text-xl[href*="/job-detail/"]',
+                # Alternative: inside div.content, the title link
+                'div.content a[href*="/job-detail/"]',
+                # Legacy selectors
+                'a[data-cy="card-title-link"]',
+                'h5 a[href*="/job-detail/"]',
+                'h4 a[href*="/job-detail/"]', 
+                'h3 a[href*="/job-detail/"]',
+            ]
+            
+            title_elem = None
+            for sel in title_selectors:
+                title_elem = await card.query_selector(sel)
+                if title_elem:
+                    # Verify this is actually the title (has text, not opacity-0)
+                    text = await title_elem.inner_text()
+                    if text.strip() and text.strip().lower() not in ['easy apply', 'apply now', '']:
+                        logger.debug(f"Dice: Found title with selector: {sel}")
+                        break
+                    title_elem = None  # Reset if this wasn't a valid title
+            
+            if not title_elem:
+                # Last resort: find all job-detail links and pick the one with actual job title text
+                all_links = await card.query_selector_all('a[href*="/job-detail/"]')
+                for link in all_links:
+                    text = await link.inner_text()
+                    text = text.strip()
+                    # Skip empty, "Easy Apply", "Apply Now", or very short text
+                    if text and len(text) > 5 and text.lower() not in ['easy apply', 'apply now', 'save', 'share']:
+                        title_elem = link
+                        logger.debug(f"Dice: Found title via link iteration: '{text[:30]}...'")
+                        break
+                
+            if not title_elem:
+                logger.debug("Dice: Could not find valid title link in card")
+                return None
+            
+            # Get title text
+            title = await title_elem.inner_text()
+            url = await title_elem.get_attribute("href")
+            
+            # Filter out "Easy Apply" and other non-job-title text that gets captured
+            # Common patterns: "Easy Apply", "Featured", "New", "Apply Now"
+            invalid_titles = [
+                "easy apply", "featured", "new", "hot", "promoted",
+                "apply now", "apply", "save", "save job", "share",
+                "view job", "see job", "learn more"
+            ]
+            title_clean = title.strip()
+            
+            # Strip badge patterns from start/end
+            for pattern in invalid_titles:
+                if title_clean.lower().startswith(pattern):
+                    title_clean = title_clean[len(pattern):].strip()
+                if title_clean.lower().endswith(pattern):
+                    title_clean = title_clean[:-len(pattern)].strip()
+            
+            # If the entire title was just invalid text, skip
+            if not title_clean or title_clean.lower() in invalid_titles:
+                logger.debug(f"Dice: Skipping card with invalid title text: '{title}'")
+                return None
+            
+            # Additional validation: real job titles are usually > 5 chars
+            if len(title_clean) < 5:
+                logger.debug(f"Dice: Skipping card with too-short title: '{title_clean}'")
+                return None
+            
+            title = title_clean
+            
+            # Company - Dice structure from HTML inspection:
+            # Find all p tags with line-clamp classes inside company-profile links
+            # Then pick the one that's not inside an image div (the text one)
+            company = ""
+            try:
+                # Get all company-profile links
+                company_links = await card.query_selector_all('a[href*="/company-profile/"]')
+                logger.debug(f"Dice: Found {len(company_links)} company-profile links")
+                
+                for i, link in enumerate(company_links):
+                    # Skip the first link if it only contains an image (logo)
+                    link_text = await link.inner_text()
+                    link_text = link_text.strip()
+                    logger.debug(f"Dice: Company link {i} text: '{link_text[:30]}'")
+                    
+                    # Look for p tags in this link
+                    p_elems = await link.query_selector_all('p')
+                    for p in p_elems:
+                        p_text = await p.inner_text()
+                        p_text = p_text.strip()
+                        # Company name should have actual text, not be empty
+                        if p_text and len(p_text) > 3:
+                            company = p_text
+                            logger.debug(f"Dice: Found company name: {company[:50]}")
+                            break
+                    
+                    if company:
+                        break
+            except Exception as e:
+                logger.debug(f"Dice: Error extracting company: {e}")
+            
+            # Location - Dice structure from HTML inspection:
+            # Look for p tags with text-zinc-600 styling that contain location info
+            # Pattern: "Remote or Boston, Massachusetts" or just "Remote"
+            location = ""
+            try:
+                # Get all p elements with location styling
+                p_elems = await card.query_selector_all('p.text-zinc-600')
+                logger.debug(f"Dice: Found {len(p_elems)} p.text-zinc-600 elements")
+                
+                for p in p_elems:
+                    text = await p.inner_text()
+                    text = text.strip()
+                    
+                    # Location text should have comma (City, State) or contain "Remote"
+                    # Should NOT be just a bullet point or time
+                    if text and (',' in text or 'remote' in text.lower()) and '•' not in text:
+                        # Filter out times like "Today" or date-like text
+                        if not text.isdigit() and len(text) > 2:
+                            location = text
+                            logger.debug(f"Dice: Found location: {location}")
+                            break
+            except Exception as e:
+                logger.debug(f"Dice: Error extracting location: {e}")
+            
+            # Description snippet
+            description_selectors = [
+                '[data-cy="card-summary"]',
+                '[data-cy="card-description"]',
+                '[class*="job-description"]',
+                '[class*="snippet"]',
+                '[class*="Summary"]',
+            ]
+            description = ""
+            for sel in description_selectors:
+                elem = await card.query_selector(sel)
+                if elem:
+                    description = await elem.inner_text()
+                    if description.strip():
+                        break
+            
+            # Ensure URL is absolute
+            if url and not url.startswith("http"):
+                url = f"https://www.dice.com{url}"
+            
+            if not title or not url:
+                logger.debug(f"Dice: Skipping card with missing title/url. title='{title}', url='{url}'")
+                return None
+            
+            # Log extracted data - use INFO level so it's visible by default
+            logger.info(f"Dice extracted: title='{title[:40]}', company='{company}', location='{location}'")
+            
+            return RawJobListing(
+                title=title.strip(),
+                company=company.strip(),
+                location=location.strip(),
+                description=description.strip(),
+                url=url.strip(),
+                source=self.source,
+            )
+        except Exception as e:
+            logger.error(f"Error parsing Dice card: {e}")
+            return None
+    
+    async def fetch_job_description(self, url: str) -> Optional[str]:
+        """
+        Fetch the full job description from a Dice job URL.
+        
+        Args:
+            url: The Dice job listing URL.
+        
+        Returns:
+            Full job description text, or None if failed.
+        """
+        context = await self.browser.new_context(
+            user_agent=self.config.user_agent,
+            viewport={"width": 1920, "height": 1080}
+        )
+        
+        try:
+            page = await context.new_page()
+            await page.goto(url, timeout=self.config.timeout * 1000)
+            await page.wait_for_load_state("networkidle", timeout=self.config.timeout * 1000)
+            
+            # Wait for JS to render
+            await asyncio.sleep(3)
+            
+            # Try to find description element - Dice uses various selectors
+            desc_selectors = [
+                '[data-testid="jobDescriptionHtml"]',
+                '[data-cy="job-description"]',
+                '#jobDescriptionHtml',
+                '#jobdescSec',
+                '.job-description',
+                '[class*="jobDescription"]',
+                '[class*="JobDescription"]',
+                'div[class*="description"]',
+                'section[class*="description"]',
+            ]
+            
+            for selector in desc_selectors:
+                desc_elem = await page.query_selector(selector)
+                if desc_elem:
+                    description = await desc_elem.inner_text()
+                    if description and len(description.strip()) > 50:
+                        return description.strip()
+            
+            logger.warning(f"Could not find description on Dice page: {url}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching Dice description from {url}: {e}")
+            return None
+        finally:
+            await context.close()
+    
+    async def close(self) -> None:
+        """Clean up resources."""
+        pass
+
+
+class BuiltInCollector(JobCollector):
+    """Collector for Built In job listings (tech/startup-focused job board)."""
+    
+    BASE_URL = "https://builtin.com/jobs"
+    
+    def __init__(self, browser: Browser, config: ScraperConfig):
+        self.browser = browser
+        self.config = config
+        self.source = "builtin"
+    
+    async def search(self, keyword: str, max_results: int = 50) -> list[RawJobListing]:
+        """
+        Search Built In for jobs matching the keyword.
+        
+        Built In is a regional site - it covers major tech hubs.
+        This collector searches the national view.
+        
+        Args:
+            keyword: Search keyword.
+            max_results: Maximum number of results to fetch.
+        
+        Returns:
+            List of raw job listings.
+        """
+        jobs = []
+        context = await self.browser.new_context(
+            user_agent=self.config.user_agent,
+            viewport={"width": 1920, "height": 1080}
+        )
+        
+        try:
+            page = await context.new_page()
+            
+            # Built In uses 'search' parameter
+            search_url = f"{self.BASE_URL}?search={quote_plus(keyword)}"
+            logger.info(f"Built In search URL: {search_url}")
+            
+            await page.goto(search_url, timeout=self.config.timeout * 1000)
+            await page.wait_for_load_state("networkidle", timeout=self.config.timeout * 1000)
+            
+            # Wait for job listings to load
+            try:
+                await page.wait_for_selector('[data-id="job-card"], .job-card', timeout=15000)
+            except PlaywrightTimeout:
+                logger.warning("Built In job list not found, page structure may have changed")
+                return jobs
+            
+            # Scroll to load more jobs
+            scroll_count = min(max_results // 20, 3)
+            for _ in range(scroll_count):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
+            
+            # Extract job cards
+            job_cards = await page.query_selector_all('[data-id="job-card"], .job-card, article[class*="job"]')
+            total_cards = len(job_cards)
+            cards_to_process = job_cards[:max_results]
+            logger.info(f"Found {total_cards} job cards on Built In, processing up to {len(cards_to_process)}")
+            
+            for card in cards_to_process:
+                try:
+                    job = await self._extract_job_from_card(card, page)
+                    if job:
+                        jobs.append(job)
+                except Exception as e:
+                    logger.error(f"Error extracting Built In job: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Built In search error: {e}")
+        finally:
+            await context.close()
+        
+        return jobs
+    
+    async def _extract_job_from_card(self, card, page: Page) -> Optional[RawJobListing]:
+        """Extract job data from a Built In job card."""
+        try:
+            # Debug: dump card HTML structure (first 500 chars)
+            card_html = await card.inner_html()
+            logger.debug(f"Built In card HTML preview: {card_html[:500]}...")
+            
+            # Get basic info from card - try multiple selector strategies
+            title_selectors = [
+                'h2 a', 'h3 a', 'a[data-id="job-title"]', '.job-title a',
+                '[class*="JobTitle"] a', '[class*="job-title"] a', 'a[href*="/job/"]'
+            ]
+            title_elem = None
+            for sel in title_selectors:
+                title_elem = await card.query_selector(sel)
+                if title_elem:
+                    logger.debug(f"Built In: Found title with selector: {sel}")
+                    break
+            
+            company_selectors = [
+                '[data-id="company-title"]', '.company-name', 'a[href*="/company/"]',
+                '[class*="CompanyName"]', '[class*="company-name"]', 'span[class*="company"]',
+                'div[class*="Company"] a', 'a[class*="company"]'
+            ]
+            company_elem = None
+            for sel in company_selectors:
+                company_elem = await card.query_selector(sel)
+                if company_elem:
+                    logger.debug(f"Built In: Found company with selector: {sel}")
+                    break
+            
+            location_selectors = [
+                # Primary: span with font-barlow and text-gray-04 classes (from inspection)
+                'span.font-barlow.text-gray-04',
+                # Fallback selectors
+                '[data-id="job-location"]', '.job-location',
+            ]
+            location_elem = None
+            for sel in location_selectors:
+                location_elem = await card.query_selector(sel)
+                if location_elem:
+                    logger.debug(f"Built In: Found location with selector: {sel}")
+                    break
+            
+            if not title_elem:
+                logger.warning("Built In: No title element found in card")
+                return None
+            
+            title = await title_elem.inner_text()
+            url = await title_elem.get_attribute("href")
+            
+            company = ""
+            if company_elem:
+                company = await company_elem.inner_text()
+            else:
+                logger.debug(f"Built In: No company element found for job: {title[:50]}")
+            
+            location = ""
+            # The selector `span.font-barlow.text-gray-04` matches BOTH work arrangement (Hybrid, In-Office)
+            # and actual location. We need to get all matching spans and filter to actual locations.
+            all_spans = await card.query_selector_all('span.font-barlow.text-gray-04')
+            for span in all_spans:
+                text = await span.inner_text()
+                text = text.strip()
+                
+                # Check for multi-location tooltip (data-bs-title attribute)
+                # This will have text like "2 Locations" or "4 Locations"
+                if text and text.lower().endswith('locations') and ' ' in text:
+                    try:
+                        tooltip_locations = await span.get_attribute("data-bs-title")
+                        if tooltip_locations:
+                            # Parse HTML like "<div class='text-truncate'>City, ST, USA</div>..."
+                            cities = re.findall(r">([^<]+)</div>", tooltip_locations)
+                            if cities:
+                                location = "; ".join(cities)
+                                logger.debug(f"Built In: Extracted {len(cities)} locations from tooltip: {location[:60]}...")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Built In: Error parsing multi-location tooltip: {e}")
+                
+                # Location patterns: "City, ST, Country", "Remote", etc.
+                # Skip: "Hybrid", "In-Office", "On-site", "Remote or Hybrid"
+                elif text and text.lower() not in ['hybrid', 'in-office', 'on-site', 'remote', 'remote or hybrid']:
+                    # Check if it looks like a location (contains comma, or has country code)
+                    if ',' in text or 'remote' in text.lower() or any(x in text for x in ['USA', 'UK', 'CA']):
+                        location = text
+                        logger.debug(f"Built In: Extracted location from span: {text}")
+                        break
+            
+            if not location:
+                logger.debug(f"Built In: No location found for job: {title[:50]}")
+            
+            # Get description snippet if available
+            description = ""
+            snippet_elem = await card.query_selector('[data-id="job-description"], .job-description, p')
+            if snippet_elem:
+                description = await snippet_elem.inner_text()
+            
+            # Log what we extracted
+            logger.info(f"Built In extracted: title='{title[:40]}', company='{company}', location='{location}'")
+            
+            # Ensure URL is absolute
+            if url and not url.startswith("http"):
+                url = f"https://builtin.com{url}"
+            
+            return RawJobListing(
+                title=title.strip(),
+                company=company.strip() if company else "",
+                location=location.strip() if location else "",
+                description=description.strip(),
+                url=url.strip() if url else "",
+                source=self.source,
+            )
+        except Exception as e:
+            logger.error(f"Error parsing Built In card: {e}")
+            return None
+    
+    async def fetch_job_description(self, url: str) -> Optional[str]:
+        """
+        Fetch the full job description from a Built In job URL.
+        
+        Args:
+            url: The Built In job listing URL.
+        
+        Returns:
+            Full job description text, or None if failed.
+        """
+        context = await self.browser.new_context(
+            user_agent=self.config.user_agent,
+            viewport={"width": 1920, "height": 1080}
+        )
+        
+        try:
+            page = await context.new_page()
+            await page.goto(url, timeout=self.config.timeout * 1000)
+            await page.wait_for_load_state("domcontentloaded", timeout=self.config.timeout * 1000)
+            
+            # Wait for description to load
+            await asyncio.sleep(2)
+            
+            # Try to find description element - Built In selectors
+            # Built In has various page layouts depending on company
+            desc_selectors = [
+                '[data-id="job-description"]',
+                '[data-testid="job-description"]',
+                '.job-description',
+                '.job-info__description',
+                '[class*="JobDescription"]',
+                '[class*="jobDescription"]',
+                'article [class*="description"]',
+                # Common content containers
+                '.job-posting-description',
+                '.posting-description',
+                '#job-description',
+                'section.description',
+                # Fallback: main content area
+                'main article',
+                '.job-details-content',
+                '[class*="JobDetails"] [class*="content"]',
+            ]
+            
+            for selector in desc_selectors:
+                desc_elem = await page.query_selector(selector)
+                if desc_elem:
+                    description = await desc_elem.inner_text()
+                    if description and len(description.strip()) > 50:
+                        return description.strip()
+            
+            # Last resort: try to find any large text block in the main area
+            main_elem = await page.query_selector('main, article, .content, #content')
+            if main_elem:
+                paragraphs = await main_elem.query_selector_all('p')
+                if len(paragraphs) > 2:
+                    texts = []
+                    for p in paragraphs[:20]:  # Limit to avoid too much text
+                        text = await p.inner_text()
+                        if text.strip():
+                            texts.append(text.strip())
+                    if texts:
+                        return "\n\n".join(texts)
+            
+            logger.warning(f"Could not find description on Built In page: {url}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching Built In description from {url}: {e}")
+            return None
+        finally:
+            await context.close()
+    
+    async def close(self) -> None:
+        """Clean up resources."""
+        pass
+
+
 class CollectorManager:
     """Manages multiple job collectors and coordinates searches."""
     
@@ -668,6 +1306,8 @@ class CollectorManager:
         # Initialize collectors
         self.collectors["linkedin"] = LinkedInCollector(self.browser, self.config)
         self.collectors["indeed"] = IndeedCollector(self.browser, self.config)
+        self.collectors["dice"] = DiceCollector(self.browser, self.config)
+        self.collectors["builtin"] = BuiltInCollector(self.browser, self.config)
         
         logger.info("Collector manager initialized with collectors: %s", 
                    list(self.collectors.keys()))

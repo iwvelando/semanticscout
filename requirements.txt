@@ -7,11 +7,16 @@ playwright>=1.40.0
 # Geocoding
 geopy>=2.4.1
 
-# HTTP Client (for Ollama API)
+# HTTP Client (for Ollama API and Slack)
 httpx>=0.25.0
 
 # Configuration
 PyYAML>=6.0.1
+
+# Embedding-based deduplication (cross-source duplicate detection)
+sentence-transformers>=2.2.0
+# Note: sentence-transformers will install torch automatically
+# It will use GPU (CUDA) if available, otherwise CPU
 
 # Async support (included in Python 3.11+, but good to have)
 asyncio-throttle>=1.0.2
