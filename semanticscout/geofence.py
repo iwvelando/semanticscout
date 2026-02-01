@@ -178,8 +178,12 @@ class Geofencer:
         """
         Geocode a location string to coordinates.
         
+        Handles semicolon-delimited multi-location strings by trying each
+        location individually and returning the first successful geocode.
+        
         Args:
-            location_str: Location string (e.g., "San Francisco, CA").
+            location_str: Location string (e.g., "San Francisco, CA" or 
+                         "Austin, TX, USA; Dallas, TX, USA").
         
         Returns:
             GeocodedLocation with coordinates if successful.
@@ -192,7 +196,62 @@ class Geofencer:
         # Check if it's a remote job
         is_remote = self.is_remote(location_str)
         
-        # Try to geocode
+        # Handle multi-location strings (semicolon-separated)
+        locations = [loc.strip() for loc in location_str.split(';') if loc.strip()]
+        if not locations:
+            locations = [location_str]
+        
+        # Try to geocode - for multi-location, try each until one succeeds
+        result = GeocodedLocation(
+            original=location_str,
+            latitude=None,
+            longitude=None,
+            is_remote=is_remote,
+        )
+        
+        for location in locations:
+            single_result = await self._geocode_single_location(location)
+            
+            # If this location is remote, mark the result as remote
+            if single_result.is_remote:
+                result.is_remote = True
+            
+            # If we got coordinates, use them and stop
+            if single_result.latitude is not None and single_result.longitude is not None:
+                result.latitude = single_result.latitude
+                result.longitude = single_result.longitude
+                result.formatted_address = single_result.formatted_address
+                if len(locations) > 1:
+                    logger.debug(f"Multi-location geocode: used '{location}' from '{location_str}'")
+                break
+        
+        # If no location geocoded successfully, mark as failed
+        if result.latitude is None and result.longitude is None and not result.is_remote:
+            result.geocoding_failed = True
+            if len(locations) > 1:
+                logger.debug(f"Could not geocode any of {len(locations)} locations in: {location_str}")
+        
+        self._geocode_cache[cache_key] = result
+        return result
+    
+    async def _geocode_single_location(self, location_str: str) -> GeocodedLocation:
+        """
+        Geocode a single location string (no semicolons).
+        
+        Args:
+            location_str: A single location string.
+        
+        Returns:
+            GeocodedLocation with coordinates if successful.
+        """
+        # Check cache first
+        cache_key = location_str.lower().strip()
+        if cache_key in self._geocode_cache:
+            return self._geocode_cache[cache_key]
+        
+        # Check if it's a remote indicator
+        is_remote = self.is_remote(location_str)
+        
         result = GeocodedLocation(
             original=location_str,
             latitude=None,
@@ -229,13 +288,13 @@ class Geofencer:
                         result.formatted_address = geo_result.address
                         logger.debug(f"Geocoded LLM-resolved '{llm_resolved}' -> ({result.latitude}, {result.longitude})")
                     else:
-                        logger.warning(f"Could not geocode LLM-resolved location: {llm_resolved}")
+                        logger.debug(f"Could not geocode LLM-resolved location: {llm_resolved}")
                         result.geocoding_failed = True
                 else:
-                    logger.warning(f"Could not geocode location (LLM fallback failed): {location_str}")
+                    logger.debug(f"LLM could not resolve location: {location_str}")
                     result.geocoding_failed = True
             else:
-                logger.warning(f"Could not geocode location: {location_str}")
+                logger.debug(f"Could not geocode location: {location_str}")
                 result.geocoding_failed = True
         
         self._geocode_cache[cache_key] = result
@@ -559,80 +618,163 @@ class Geofencer:
                 matched_city="Anywhere"  # Indicates no geo filter applied
             )
         
-        # Get coordinates
-        latitude = job.latitude
-        longitude = job.longitude
+        # Handle multi-location jobs (semicolon-separated)
+        # Split and try each location - if ANY is within geofence, job passes
+        locations = [loc.strip() for loc in job.location.split(';') if loc.strip()]
         
-        if latitude is None or longitude is None:
-            # Need to geocode
-            geocoded = await self.geocode(job.location)
-            
-            if geocoded.is_remote:
-                if self.include_remote:
-                    return GeoFilterResult(
-                        passes=True,
-                        is_remote=True,
-                        distance_miles=None,
-                        matched_city="Remote"
+        # If no valid locations parsed, treat as single location
+        if not locations:
+            locations = [job.location]
+        
+        # Track if we're dealing with multi-location and results
+        is_multi_location = len(locations) > 1
+        if is_multi_location:
+            logger.debug(f"Job '{job.title}' has {len(locations)} locations, checking each")
+        
+        # Try each location
+        for location in locations:
+            result = await self._check_single_location(job, location)
+            if result.passes:
+                if is_multi_location:
+                    logger.debug(
+                        f"Job '{job.title}' matches via location '{location}' "
+                        f"(city={result.matched_city}, distance={result.distance_miles}mi)"
                     )
-                else:
-                    return GeoFilterResult(
-                        passes=False,
-                        is_remote=True,
-                        distance_miles=None,
-                        matched_city=None
-                    )
-            
-            if geocoded.latitude is None or geocoded.longitude is None:
-                # Could not geocode - exclude
-                logger.warning(
-                    f"Could not geocode job '{job.title}' at '{job.location}', excluding"
+                return result
+        
+        # None of the locations matched
+        if is_multi_location:
+            logger.debug(f"Job '{job.title}' - none of {len(locations)} locations matched geofence")
+        
+        # Return failure with distance to nearest city from first location attempt
+        # We need to return a meaningful distance for logging
+        return await self._get_failure_result(job, locations[0])
+    
+    async def _check_single_location(self, job: Job, location: str) -> GeoFilterResult:
+        """
+        Check if a single location string passes the geofence filter.
+        
+        Args:
+            job: The job being filtered.
+            location: A single location string to check.
+        
+        Returns:
+            GeoFilterResult for this location.
+        """
+        # Check if this specific location indicates remote
+        if self.is_remote(location, ""):
+            if self.include_remote:
+                return GeoFilterResult(
+                    passes=True,
+                    is_remote=True,
+                    distance_miles=None,
+                    matched_city="Remote"
                 )
+            else:
                 return GeoFilterResult(
                     passes=False,
-                    is_remote=False,
+                    is_remote=True,
                     distance_miles=None,
                     matched_city=None
                 )
-            
-            latitude = geocoded.latitude
-            longitude = geocoded.longitude
         
-        # Check against all cities
-        matched_city, distance = self.find_matching_city(latitude, longitude)
+        # Get coordinates - check if already cached on job (only for primary location)
+        latitude = None
+        longitude = None
         
-        if matched_city:
-            logger.debug(
-                f"Job '{job.title}' at '{job.location}' is {distance:.1f} miles "
-                f"from '{matched_city}' (within radius)"
-            )
-            return GeoFilterResult(
-                passes=True,
-                is_remote=False,
-                distance_miles=distance,
-                matched_city=matched_city
-            )
-        else:
-            # Log distance to nearest city for debugging
-            if self.cities:
-                min_city = None
-                min_distance = float('inf')
-                for city_name in self.cities:
-                    d = self.calculate_distance_from_city(city_name, latitude, longitude)
-                    if d < min_distance:
-                        min_distance = d
-                        min_city = city_name
-                logger.debug(
-                    f"Job '{job.title}' at '{job.location}' is {min_distance:.1f} miles "
-                    f"from nearest city '{min_city}' (outside all radii)"
+        # Try to geocode this location
+        geocoded = await self.geocode(location)
+        
+        if geocoded.is_remote:
+            if self.include_remote:
+                return GeoFilterResult(
+                    passes=True,
+                    is_remote=True,
+                    distance_miles=None,
+                    matched_city="Remote"
                 )
-            
+            else:
+                return GeoFilterResult(
+                    passes=False,
+                    is_remote=True,
+                    distance_miles=None,
+                    matched_city=None
+                )
+        
+        if geocoded.latitude is None or geocoded.longitude is None:
+            # Could not geocode this location - continue to next
+            logger.debug(f"Could not geocode location '{location}' for job '{job.title}'")
             return GeoFilterResult(
                 passes=False,
                 is_remote=False,
                 distance_miles=None,
                 matched_city=None
             )
+        
+        latitude = geocoded.latitude
+        longitude = geocoded.longitude
+        
+        # Check against all cities
+        matched_city, distance = self.find_matching_city(latitude, longitude)
+        
+        if matched_city:
+            return GeoFilterResult(
+                passes=True,
+                is_remote=False,
+                distance_miles=distance,
+                matched_city=matched_city
+            )
+        
+        # This location didn't match
+        return GeoFilterResult(
+            passes=False,
+            is_remote=False,
+            distance_miles=distance,  # Will be None since we didn't calculate it here
+            matched_city=None
+        )
+    
+    async def _get_failure_result(self, job: Job, primary_location: str) -> GeoFilterResult:
+        """
+        Generate a failure result with distance info for logging.
+        
+        Args:
+            job: The job that failed filtering.
+            primary_location: The primary location to use for distance calculation.
+        
+        Returns:
+            GeoFilterResult indicating failure.
+        """
+        # Try to get coordinates for logging distance
+        geocoded = await self.geocode(primary_location)
+        
+        if geocoded.latitude and geocoded.longitude and self.cities:
+            min_city = None
+            min_distance = float('inf')
+            for city_name in self.cities:
+                dist = self.calculate_distance_from_city(
+                    city_name, geocoded.latitude, geocoded.longitude
+                )
+                if dist < min_distance:
+                    min_distance = dist
+                    min_city = city_name
+            
+            logger.debug(
+                f"Job '{job.title}' at '{job.location}' is {min_distance:.1f} miles "
+                f"from nearest city '{min_city}' (outside radius)"
+            )
+            return GeoFilterResult(
+                passes=False,
+                is_remote=False,
+                distance_miles=min_distance,
+                matched_city=None
+            )
+        
+        return GeoFilterResult(
+            passes=False,
+            is_remote=False,
+            distance_miles=None,
+            matched_city=None
+        )
     
     async def enrich_job_location(self, job: Job) -> Job:
         """
