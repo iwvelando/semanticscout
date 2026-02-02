@@ -196,12 +196,21 @@ class SemanticScoutPipeline:
             logger.info("STEP 3: Applying geographic filter")
             logger.info("=" * 60)
             
-            # Get all unscored jobs (not just new ones)
-            unscored_jobs = self.db.get_unscored_jobs()
-            logger.info(f"Found {len(unscored_jobs)} unscored jobs to process")
+            # Get all incomplete jobs (not just new ones, includes previously failed)
+            incomplete_jobs = self.db.get_incomplete_jobs()
+            
+            # Log breakdown of incomplete jobs
+            previously_failed = [j for j in incomplete_jobs if j.id not in [nj.id for nj in new_jobs]]
+            if previously_failed:
+                logger.info(
+                    f"Found {len(incomplete_jobs)} incomplete jobs to process "
+                    f"({len(new_jobs)} new, {len(previously_failed)} retrying from previous failures)"
+                )
+            else:
+                logger.info(f"Found {len(incomplete_jobs)} incomplete jobs to process")
             
             jobs_to_score = []
-            for job in unscored_jobs:
+            for job in incomplete_jobs:
                 result = await self.geofencer.filter_job(job)
                 
                 if result.passes:
@@ -261,16 +270,19 @@ class SemanticScoutPipeline:
                                 result.reasoning,
                                 self.config.llm.model
                             )
+                            # Mark job as fully processed after successful scoring
+                            self.db.mark_processing_complete(job.id)
                             stats["jobs_scored"] += 1
                             
                             if result.score >= self.config.reporting.min_score_threshold:
                                 stats["high_scoring_jobs"] += 1
                         elif not result.success:
+                            # Job remains with processing_complete=False for retry next run
                             stats["errors"].append(
                                 f"Failed to score '{job.title}': {result.error}"
                             )
                 else:
-                    stats["errors"].append("Could not initialize LLM scorer")
+                    stats["errors"].append("Could not initialize LLM scorer - jobs will be retried next run")
             
             # Step 6: Generate reports
             logger.info("=" * 60)
@@ -302,7 +314,12 @@ class SemanticScoutPipeline:
     
     async def score_only(self) -> dict:
         """
-        Run only the scoring step for unscored jobs.
+        Run only the scoring step for unscored or incomplete jobs.
+        
+        This mode is useful for retrying LLM scoring after failures.
+        It processes jobs that either:
+        - Have never been scored (semantic_score IS NULL)
+        - Have processing_complete = FALSE (failed in a previous run)
         
         Returns:
             Dictionary with scoring statistics.
@@ -314,15 +331,16 @@ class SemanticScoutPipeline:
         }
         
         try:
-            unscored_jobs = self.db.get_unscored_jobs()
-            logger.info(f"Found {len(unscored_jobs)} unscored jobs")
+            # Get all incomplete jobs (includes unscored and previously failed)
+            incomplete_jobs = self.db.get_incomplete_jobs()
+            logger.info(f"Found {len(incomplete_jobs)} incomplete jobs to process")
             
-            if not unscored_jobs:
-                logger.info("No unscored jobs to process")
+            if not incomplete_jobs:
+                logger.info("No incomplete jobs to process")
                 return stats
             
             # Apply geofence filter
-            jobs_to_score = await self.geofencer.filter_jobs(unscored_jobs)
+            jobs_to_score = await self.geofencer.filter_jobs(incomplete_jobs)
             
             if not jobs_to_score:
                 logger.info("No jobs passed geographic filter")
@@ -339,10 +357,19 @@ class SemanticScoutPipeline:
                             result.reasoning,
                             self.config.llm.model
                         )
+                        # Mark job as fully processed after successful scoring
+                        self.db.mark_processing_complete(job.id)
                         stats["jobs_scored"] += 1
                         
                         if result.score >= self.config.reporting.min_score_threshold:
                             stats["high_scoring_jobs"] += 1
+                    elif not result.success:
+                        # Job remains incomplete for retry
+                        stats["errors"].append(
+                            f"Failed to score '{job.title}': {result.error}"
+                        )
+            else:
+                stats["errors"].append("Could not initialize LLM scorer - jobs will be retried next run")
             
         finally:
             await self.scorer_manager.close()
@@ -380,6 +407,7 @@ class SemanticScoutPipeline:
         print(f"Total jobs tracked: {stats['total_jobs']}")
         print(f"Jobs scored: {stats['scored_jobs']}")
         print(f"High-scoring jobs (>= 7): {stats['high_scoring_jobs']}")
+        print(f"Incomplete jobs (pending retry): {stats.get('incomplete_jobs', 0)}")
         
         if stats.get('average_score'):
             print(f"Average score: {stats['average_score']}")

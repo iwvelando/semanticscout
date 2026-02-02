@@ -53,6 +53,7 @@ class Job:
     created_at: datetime
     updated_at: datetime
     raw_data: Optional[str]
+    processing_complete: bool = False  # True when all LLM-dependent processing has succeeded
     
     @classmethod
     def create_hash(cls, title: str, company: str, url: str) -> str:
@@ -110,7 +111,8 @@ class Database:
                     application_status TEXT DEFAULT 'new',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    raw_data TEXT
+                    raw_data TEXT,
+                    processing_complete BOOLEAN DEFAULT FALSE
                 )
             """)
             
@@ -134,6 +136,13 @@ class Database:
             if "matched_city" not in columns:
                 cursor.execute("ALTER TABLE jobs ADD COLUMN matched_city TEXT")
                 logger.info("Migrated database: added matched_city column")
+            
+            # Migrate existing databases: add processing_complete column if missing
+            if "processing_complete" not in columns:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN processing_complete BOOLEAN DEFAULT FALSE")
+                # Mark already-scored jobs as complete (they succeeded before this feature)
+                cursor.execute("UPDATE jobs SET processing_complete = TRUE WHERE semantic_score IS NOT NULL")
+                logger.info("Migrated database: added processing_complete column")
             
             # Create search history table
             cursor.execute("""
@@ -196,13 +205,14 @@ class Database:
                 INSERT INTO jobs (
                     job_hash, title, company, location, description, url, source,
                     latitude, longitude, is_remote, distance_miles, matched_city,
-                    semantic_score, score_reasoning, application_status, raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    semantic_score, score_reasoning, application_status, raw_data,
+                    processing_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.job_hash, job.title, job.company, job.location, job.description,
                 job.url, job.source, job.latitude, job.longitude, job.is_remote,
                 job.distance_miles, job.matched_city, job.semantic_score, job.score_reasoning,
-                job.application_status.value, job.raw_data
+                job.application_status.value, job.raw_data, job.processing_complete
             ))
             conn.commit()
             return cursor.lastrowid
@@ -285,6 +295,46 @@ class Database:
             """, (job_id, score, reasoning, model))
             
             conn.commit()
+    
+    def mark_processing_complete(self, job_id: int) -> None:
+        """
+        Mark a job as having completed all LLM-dependent processing.
+        
+        This should only be called after successful scoring.
+        Jobs that fail LLM processing remain incomplete for retry.
+        
+        Args:
+            job_id: The ID of the job to mark complete.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE jobs 
+                SET processing_complete = TRUE, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (job_id,))
+            conn.commit()
+    
+    def get_incomplete_jobs(self) -> list[Job]:
+        """
+        Get all jobs where LLM-dependent processing has not completed.
+        
+        This includes jobs that:
+        - Have not been scored yet
+        - Failed during LLM geocoding fallback
+        - Failed during scoring
+        
+        Returns:
+            List of incomplete Job objects.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM jobs 
+                WHERE processing_complete = FALSE OR processing_complete IS NULL
+                ORDER BY created_at DESC
+            """)
+            return [self._row_to_job(row) for row in cursor.fetchall()]
     
     def update_application_status(
         self, 
@@ -469,6 +519,10 @@ class Database:
             cursor.execute("SELECT COUNT(*) FROM jobs WHERE semantic_score >= 7")
             stats["high_scoring_jobs"] = cursor.fetchone()[0]
             
+            # Incomplete jobs (pending retry)
+            cursor.execute("SELECT COUNT(*) FROM jobs WHERE processing_complete = FALSE OR processing_complete IS NULL")
+            stats["incomplete_jobs"] = cursor.fetchone()[0]
+            
             # Jobs by source
             cursor.execute("""
                 SELECT source, COUNT(*) 
@@ -501,4 +555,5 @@ class Database:
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else datetime.now(),
             updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else datetime.now(),
             raw_data=row["raw_data"],
+            processing_complete=bool(row["processing_complete"]) if "processing_complete" in row.keys() else False,
         )

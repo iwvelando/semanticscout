@@ -1532,6 +1532,7 @@ def raw_to_job(raw: RawJobListing, existing_hash: Optional[str] = None) -> Job:
         created_at=datetime.now(),
         updated_at=datetime.now(),
         raw_data=str(raw.raw_data) if raw.raw_data else None,
+        processing_complete=False,  # New jobs start as incomplete
     )
 
 
