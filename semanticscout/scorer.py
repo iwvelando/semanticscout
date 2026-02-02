@@ -146,9 +146,84 @@ Do not include any other text outside the JSON object."""
             logger.error(f"Model availability check failed: {e}")
             return False
     
+    async def _restart_ollama(self) -> bool:
+        """
+        Restart Ollama service by POSTing to the configured restart URL.
+        
+        Returns:
+            True if restart request succeeded, False otherwise.
+        """
+        if not self.llm_config.restart_url:
+            logger.warning("Ollama restart requested but no restart_url configured")
+            return False
+        
+        try:
+            logger.info(f"Requesting Ollama restart via {self.llm_config.restart_url}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    self.llm_config.restart_url,
+                    json={"action": "restart", "mode": "replace"},
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code in [200, 201, 202, 204]:
+                    logger.info(f"Ollama restart initiated, waiting {self.llm_config.restart_wait_seconds}s for stabilization")
+                    await asyncio.sleep(self.llm_config.restart_wait_seconds)
+                    return True
+                else:
+                    logger.error(f"Ollama restart failed: {response.status_code} - {response.text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error requesting Ollama restart: {e}")
+            return False
+    
     async def score_job(self, job: Job) -> ScoringResult:
         """
-        Score a single job listing.
+        Score a single job listing with automatic retry on failure.
+        
+        If configured, will restart Ollama and retry on failures like
+        timeouts or 502 errors.
+        
+        Args:
+            job: The job to score.
+        
+        Returns:
+            ScoringResult with the score and reasoning.
+        """
+        max_attempts = 1 + self.llm_config.retry_attempts
+        
+        for attempt in range(max_attempts):
+            result = await self._attempt_score_job(job)
+            
+            if result.success:
+                return result
+            
+            # If this was the last attempt, return the failure
+            if attempt == max_attempts - 1:
+                logger.warning(
+                    f"Job '{job.title}' scoring failed after {max_attempts} attempts: {result.error}"
+                )
+                return result
+            
+            # Restart Ollama and retry
+            logger.warning(
+                f"Job '{job.title}' scoring failed (attempt {attempt + 1}/{max_attempts}): {result.error}"
+            )
+            
+            if self.llm_config.restart_url:
+                logger.info(f"Attempting Ollama restart before retry {attempt + 2}/{max_attempts}")
+                await self._restart_ollama()
+            else:
+                logger.info(f"No restart_url configured, retrying without restart")
+                # Brief delay before retry even without restart
+                await asyncio.sleep(2)
+        
+        return result  # Should never reach here, but for completeness
+    
+    async def _attempt_score_job(self, job: Job) -> ScoringResult:
+        """
+        Single attempt to score a job (internal method).
         
         Args:
             job: The job to score.

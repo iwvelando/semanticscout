@@ -329,6 +329,8 @@ class Geofencer:
         Uses consensus voting: queries the LLM multiple times and only
         accepts a result if there's sufficient agreement.
         
+        Includes automatic retry with Ollama restart on failures.
+        
         Args:
             location_str: The ambiguous location string.
         
@@ -343,14 +345,67 @@ class Geofencer:
         if not self.llm_config:
             return None
         
+        # Retry logic
+        max_attempts = 1 + (self.llm_config.retry_attempts if self.llm_config else 0)
+        
+        for attempt in range(max_attempts):
+            try:
+                result = await self._query_llm_for_location(location_str)
+                
+                # Cache and return result (even if None)
+                self._llm_location_cache[cache_key] = result
+                return result
+                
+            except Exception as e:
+                logger.error(f"LLM location resolution error (attempt {attempt + 1}/{max_attempts}): {e}")
+                
+                # If this was the last attempt, cache None and return
+                if attempt == max_attempts - 1:
+                    self._llm_location_cache[cache_key] = None
+                    return None
+                
+                # Restart Ollama and retry
+                if self.llm_config and self.llm_config.restart_url:
+                    logger.info(f"Attempting Ollama restart before retry {attempt + 2}/{max_attempts}")
+                    await self._restart_ollama()
+                else:
+                    # Brief delay before retry even without restart
+                    await asyncio.sleep(2)
+        
+        self._llm_location_cache[cache_key] = None
+        return None
+    
+    async def _restart_ollama(self) -> bool:
+        """
+        Restart Ollama service by POSTing to the configured restart URL.
+        
+        Returns:
+            True if restart request succeeded, False otherwise.
+        """
+        if not self.llm_config or not self.llm_config.restart_url:
+            logger.warning("Ollama restart requested but no restart_url configured")
+            return False
+        
         try:
-            result = await self._query_llm_for_location(location_str)
-            self._llm_location_cache[cache_key] = result
-            return result
+            logger.info(f"Requesting Ollama restart via {self.llm_config.restart_url}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    self.llm_config.restart_url,
+                    json={"action": "restart", "mode": "replace"},
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code in [200, 201, 202, 204]:
+                    logger.info(f"Ollama restart initiated, waiting {self.llm_config.restart_wait_seconds}s for stabilization")
+                    await asyncio.sleep(self.llm_config.restart_wait_seconds)
+                    return True
+                else:
+                    logger.error(f"Ollama restart failed: {response.status_code} - {response.text}")
+                    return False
+                    
         except Exception as e:
-            logger.error(f"LLM location resolution error: {e}")
-            self._llm_location_cache[cache_key] = None
-            return None
+            logger.error(f"Error requesting Ollama restart: {e}")
+            return False
     
     async def _query_llm_for_location(self, location_str: str) -> Optional[str]:
         """
@@ -361,6 +416,9 @@ class Geofencer:
         
         Returns:
             Resolved "City, State" string or None if no consensus.
+            
+        Raises:
+            Exception: If LLM queries fail (e.g., timeout, 502 error).
         """
         prompt = (
             f'What is the best City, State assignment for "{location_str}"? '
@@ -370,6 +428,7 @@ class Geofencer:
         )
         
         responses = []
+        last_error = None
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             for i in range(self.llm_geocode_queries):
@@ -396,10 +455,21 @@ class Geofencer:
                         if cleaned:
                             responses.append(cleaned)
                             logger.debug(f"LLM query {i+1}: '{location_str}' -> '{cleaned}'")
+                    else:
+                        # Track API errors (like 502) to potentially trigger restart
+                        last_error = Exception(f"Ollama API error: {response.status_code}")
+                        logger.debug(f"LLM query {i+1} failed: {response.status_code}")
                         
+                except httpx.TimeoutException as e:
+                    last_error = e
+                    logger.debug(f"LLM query {i+1} timed out")
                 except Exception as e:
+                    last_error = e
                     logger.debug(f"LLM query {i+1} failed: {e}")
-                    continue
+        
+        # If we got no valid responses and had errors, raise to trigger retry
+        if not responses and last_error:
+            raise last_error
         
         if not responses:
             logger.warning(f"No valid LLM responses for location: {location_str}")

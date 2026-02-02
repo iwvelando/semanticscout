@@ -11,6 +11,12 @@ llm:
   context_window: 8192  # Total context window (num_ctx) for input + output
                         # Higher values allow longer job descriptions but use more VRAM
                         # GTX 1080 (8GB) can comfortably handle 8192-16384
+  
+  # Ollama Restart/Retry Configuration (optional)
+  # Handles GPU loss and 502 errors by restarting Ollama automatically
+  # restart_url: "http://localhost:8080/restart"  # URL to POST for restarting Ollama service
+  # restart_wait_seconds: 10  # Seconds to wait after restart before retry
+  # retry_attempts: 1  # Number of retry attempts with restart on LLM failures
 
 # Geographic Targeting
 #
