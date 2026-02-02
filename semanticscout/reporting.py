@@ -43,6 +43,9 @@ class ReportGenerator:
         """
         Generate a daily summary report.
         
+        Reports only NEW (unreported) jobs to both local file and Slack.
+        If no new jobs: writes local file saying "no new jobs", but skips Slack.
+        
         Args:
             date: The date to report on (defaults to today).
         
@@ -55,16 +58,16 @@ class ReportGenerator:
         # Get start of day
         start_of_day = date.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Get high-scoring jobs from today
-        jobs = self.db.get_jobs_by_score_threshold(
+        # Get only NEW (unreported) high-scoring jobs for reporting
+        new_jobs = self.db.get_unreported_jobs_by_score(
             min_score=self.config.min_score_threshold,
             since=start_of_day
         )
         
-        # Generate report
-        report = self._build_daily_report(jobs, date)
+        # Generate report for local file (shows only new jobs)
+        report = self._build_daily_report(new_jobs, date)
         
-        # Save to file if configured
+        # Always save to file (even if no new jobs)
         if self.config.save_to_file:
             filename = f"daily_report_{date.strftime('%Y-%m-%d')}.md"
             filepath = self.output_dir / filename
@@ -72,11 +75,18 @@ class ReportGenerator:
             with open(filepath, 'w') as f:
                 f.write(report)
             
-            logger.info(f"Daily report saved to: {filepath}")
+            if new_jobs:
+                logger.info(f"Daily report saved to: {filepath} ({len(new_jobs)} new jobs)")
+            else:
+                logger.info(f"Daily report saved to: {filepath} (no new jobs)")
         
-        # Send to Slack if configured
+        # Send to Slack only if there are new jobs
         if self.config.slack.enabled:
-            self._send_to_slack(report, jobs, date)
+            if new_jobs:
+                logger.info(f"Sending {len(new_jobs)} new jobs to Slack")
+                self._send_to_slack(report, new_jobs, date)
+            else:
+                logger.info("No new jobs to report - skipping Slack notification")
         
         return report
     
@@ -85,7 +95,7 @@ class ReportGenerator:
         Build the markdown content for a daily report.
         
         Args:
-            jobs: List of high-scoring jobs.
+            jobs: List of NEW (unreported) high-scoring jobs.
             date: The report date.
         
         Returns:
@@ -101,14 +111,16 @@ class ReportGenerator:
             f"",
             f"## Summary",
             f"",
-            f"- **High-scoring jobs found:** {len(jobs)}",
+            f"- **New high-scoring jobs found:** {len(jobs)}",
             f"- **Minimum score threshold:** {self.config.min_score_threshold}",
             f"",
         ]
         
         if not jobs:
             lines.extend([
-                "No jobs scoring above the threshold were found today.",
+                "No new jobs scoring above the threshold were found today.",
+                "",
+                "_This report tracks only jobs not previously reported._",
                 ""
             ])
         else:
@@ -493,6 +505,8 @@ class ReportGenerator:
         Note: Webhooks cannot use threading or upload files.
         Shows summary with top 5 jobs inline.
         
+        Marks jobs as reported only after successful Slack response.
+        
         Args:
             jobs: List of jobs in the report.
             date: The report date.
@@ -521,6 +535,10 @@ class ReportGenerator:
             
             if response.status_code == 200:
                 logger.info("Slack webhook notification sent successfully")
+                # Mark jobs as reported after successful send
+                job_ids = [job.id for job in jobs if job.id]
+                if job_ids:
+                    self.db.mark_jobs_as_reported(job_ids)
                 return True
             else:
                 logger.error(
@@ -595,6 +613,8 @@ class ReportGenerator:
         Posts a summary message, then replies with threaded messages
         containing batches of jobs (5 per thread).
         
+        Marks jobs as reported only after all threads are successfully posted.
+        
         Args:
             report: The full markdown report (not used with threading).
             jobs: List of jobs in the report.
@@ -639,9 +659,14 @@ class ReportGenerator:
             thread_ts = result.get("ts")
             if not thread_ts:
                 logger.warning("Could not get thread_ts for replies")
-                return True  # Summary posted, just can't thread
+                # Still mark as reported since summary was posted
+                job_ids = [job.id for job in jobs if job.id]
+                if job_ids:
+                    self.db.mark_jobs_as_reported(job_ids)
+                return True
             
             # Post threaded replies with job batches
+            successfully_posted_jobs = []
             if jobs:
                 sorted_jobs = sorted(
                     jobs, key=lambda j: j.semantic_score or 0, reverse=True
@@ -673,6 +698,8 @@ class ReportGenerator:
                                 f"Posted thread batch {batch_num + 1} "
                                 f"(jobs {start_rank}-{start_rank + len(batch) - 1})"
                             )
+                            # Track successfully posted jobs from this batch
+                            successfully_posted_jobs.extend(batch)
                         else:
                             logger.warning(
                                 f"Thread batch {batch_num + 1} error: "
@@ -685,9 +712,17 @@ class ReportGenerator:
                         )
                 
                 logger.info(
-                    f"Posted {(len(sorted_jobs) + batch_size - 1) // batch_size} "
-                    f"threaded replies with {len(sorted_jobs)} jobs"
+                    f"Posted {(len(successfully_posted_jobs) + batch_size - 1) // batch_size} "
+                    f"threaded replies with {len(successfully_posted_jobs)} jobs"
                 )
+            
+            # Mark jobs as reported only if they were successfully posted
+            # (either in summary for no jobs, or in threads for jobs)
+            if not jobs or successfully_posted_jobs:
+                job_ids = [job.id for job in successfully_posted_jobs if job.id]
+                if job_ids:
+                    self.db.mark_jobs_as_reported(job_ids)
+                    logger.info(f"Marked {len(job_ids)} jobs as reported")
             
             return True
     

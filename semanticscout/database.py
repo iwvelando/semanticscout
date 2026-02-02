@@ -54,6 +54,7 @@ class Job:
     updated_at: datetime
     raw_data: Optional[str]
     processing_complete: bool = False  # True when all LLM-dependent processing has succeeded
+    reported: bool = False  # True when job has been successfully reported to Slack
     
     @classmethod
     def create_hash(cls, title: str, company: str, url: str) -> str:
@@ -112,7 +113,8 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     raw_data TEXT,
-                    processing_complete BOOLEAN DEFAULT FALSE
+                    processing_complete BOOLEAN DEFAULT FALSE,
+                    reported BOOLEAN DEFAULT FALSE
                 )
             """)
             
@@ -143,6 +145,18 @@ class Database:
                 # Mark already-scored jobs as complete (they succeeded before this feature)
                 cursor.execute("UPDATE jobs SET processing_complete = TRUE WHERE semantic_score IS NOT NULL")
                 logger.info("Migrated database: added processing_complete column")
+            
+            # Migrate existing databases: add reported column if missing
+            if "reported" not in columns:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN reported BOOLEAN DEFAULT FALSE")
+                # Mark existing high-scoring jobs as reported (they may have been reported before this feature)
+                # This prevents re-reporting old jobs on first run after migration
+                # Use 12 hours to avoid re-reporting jobs from the last automated run
+                cursor.execute(
+                    "UPDATE jobs SET reported = TRUE WHERE semantic_score >= ? AND created_at < datetime('now', '-12 hours')",
+                    (7.0,)  # Assuming 7.0 is typical threshold
+                )
+                logger.info("Migrated database: added reported column")
             
             # Create search history table
             cursor.execute("""
@@ -206,13 +220,13 @@ class Database:
                     job_hash, title, company, location, description, url, source,
                     latitude, longitude, is_remote, distance_miles, matched_city,
                     semantic_score, score_reasoning, application_status, raw_data,
-                    processing_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    processing_complete, reported
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.job_hash, job.title, job.company, job.location, job.description,
                 job.url, job.source, job.latitude, job.longitude, job.is_remote,
                 job.distance_miles, job.matched_city, job.semantic_score, job.score_reasoning,
-                job.application_status.value, job.raw_data, job.processing_complete
+                job.application_status.value, job.raw_data, job.processing_complete, job.reported
             ))
             conn.commit()
             return cursor.lastrowid
@@ -334,6 +348,69 @@ class Database:
                 WHERE processing_complete = FALSE OR processing_complete IS NULL
                 ORDER BY created_at DESC
             """)
+            return [self._row_to_job(row) for row in cursor.fetchall()]
+    
+    def mark_jobs_as_reported(self, job_ids: list[int]) -> None:
+        """
+        Mark multiple jobs as having been reported to Slack.
+        
+        This should only be called after successful Slack API response
+        confirming the jobs were posted.
+        
+        Args:
+            job_ids: List of job IDs to mark as reported.
+        """
+        if not job_ids:
+            return
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join('?' * len(job_ids))
+            cursor.execute(f"""
+                UPDATE jobs 
+                SET reported = TRUE, updated_at = CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders})
+            """, job_ids)
+            conn.commit()
+            logger.info(f"Marked {len(job_ids)} jobs as reported")
+    
+    def get_unreported_jobs_by_score(
+        self,
+        min_score: float,
+        since: Optional[datetime] = None
+    ) -> list[Job]:
+        """
+        Get high-scoring jobs that haven't been reported yet.
+        
+        This is used to get only NEW jobs for Slack reporting,
+        avoiding duplicate notifications.
+        
+        Args:
+            min_score: Minimum semantic score.
+            since: Only include jobs created after this datetime.
+        
+        Returns:
+            List of unreported high-scoring Job objects.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if since:
+                cursor.execute("""
+                    SELECT * FROM jobs 
+                    WHERE semantic_score >= ? 
+                    AND (reported = FALSE OR reported IS NULL)
+                    AND created_at >= ?
+                    ORDER BY semantic_score DESC
+                """, (min_score, since))
+            else:
+                cursor.execute("""
+                    SELECT * FROM jobs 
+                    WHERE semantic_score >= ?
+                    AND (reported = FALSE OR reported IS NULL)
+                    ORDER BY semantic_score DESC
+                """, (min_score,))
+            
             return [self._row_to_job(row) for row in cursor.fetchall()]
     
     def update_application_status(
@@ -556,4 +633,5 @@ class Database:
             updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else datetime.now(),
             raw_data=row["raw_data"],
             processing_complete=bool(row["processing_complete"]) if "processing_complete" in row.keys() else False,
+            reported=bool(row["reported"]) if "reported" in row.keys() else False,
         )
