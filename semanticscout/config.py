@@ -21,8 +21,11 @@ class LLMConfig:
     temperature: float = 0.3
     max_tokens: int = 500  # Output token limit (num_predict)
     context_window: int = 8192  # Total context window (num_ctx) for input + output
-    # Ollama restart/retry configuration
-    restart_url: Optional[str] = None  # URL to POST for restarting Ollama (e.g., http://localhost:8080/restart)
+    # LLM service restart/retry configuration
+    restart_url: Optional[str] = None  # URL for restarting the LLM service (e.g., http://localhost:8080/restart)
+    restart_method: str = "POST"  # HTTP method for restart request
+    restart_headers: Optional[dict[str, str]] = field(default_factory=lambda: {"Content-Type": "application/json"})
+    restart_payload: Optional[dict] = field(default_factory=lambda: {"action": "restart", "mode": "replace"})
     restart_wait_seconds: int = 10  # Seconds to wait after restart before retry
     retry_attempts: int = 1  # Number of times to retry with restart on failure
 

@@ -21,6 +21,7 @@ from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
 from .config import LocationConfig, LLMConfig
 from .database import Job
+from .llm_utils import retry_with_restart
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +330,7 @@ class Geofencer:
         Uses consensus voting: queries the LLM multiple times and only
         accepts a result if there's sufficient agreement.
         
-        Includes automatic retry with Ollama restart on failures.
+        Includes automatic retry with service restart on failures.
         
         Args:
             location_str: The ambiguous location string.
@@ -345,8 +346,8 @@ class Geofencer:
         if not self.llm_config:
             return None
         
-        # Retry logic
-        max_attempts = 1 + (self.llm_config.retry_attempts if self.llm_config else 0)
+        # Retry logic with service restart
+        max_attempts = 1 + self.llm_config.retry_attempts
         
         for attempt in range(max_attempts):
             try:
@@ -364,48 +365,18 @@ class Geofencer:
                     self._llm_location_cache[cache_key] = None
                     return None
                 
-                # Restart Ollama and retry
-                if self.llm_config and self.llm_config.restart_url:
-                    logger.info(f"Attempting Ollama restart before retry {attempt + 2}/{max_attempts}")
-                    await self._restart_ollama()
+                # Restart service and retry
+                if self.llm_config.restart_url:
+                    logger.info(f"Attempting service restart before retry {attempt + 2}/{max_attempts}")
+                    from .llm_utils import restart_llm_service
+                    await restart_llm_service(self.llm_config)
                 else:
+                    logger.info(f"No restart_url configured, retrying without restart")
                     # Brief delay before retry even without restart
                     await asyncio.sleep(2)
         
         self._llm_location_cache[cache_key] = None
         return None
-    
-    async def _restart_ollama(self) -> bool:
-        """
-        Restart Ollama service by POSTing to the configured restart URL.
-        
-        Returns:
-            True if restart request succeeded, False otherwise.
-        """
-        if not self.llm_config or not self.llm_config.restart_url:
-            logger.warning("Ollama restart requested but no restart_url configured")
-            return False
-        
-        try:
-            logger.info(f"Requesting Ollama restart via {self.llm_config.restart_url}")
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.llm_config.restart_url,
-                    json={"action": "restart", "mode": "replace"},
-                    headers={"Content-Type": "application/json"}
-                )
-                
-                if response.status_code in [200, 201, 202, 204]:
-                    logger.info(f"Ollama restart initiated, waiting {self.llm_config.restart_wait_seconds}s for stabilization")
-                    await asyncio.sleep(self.llm_config.restart_wait_seconds)
-                    return True
-                else:
-                    logger.error(f"Ollama restart failed: {response.status_code} - {response.text}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Error requesting Ollama restart: {e}")
-            return False
     
     async def _query_llm_for_location(self, location_str: str) -> Optional[str]:
         """
@@ -457,7 +428,7 @@ class Geofencer:
                             logger.debug(f"LLM query {i+1}: '{location_str}' -> '{cleaned}'")
                     else:
                         # Track API errors (like 502) to potentially trigger restart
-                        last_error = Exception(f"Ollama API error: {response.status_code}")
+                        last_error = Exception(f"LLM API error: {response.status_code}")
                         logger.debug(f"LLM query {i+1} failed: {response.status_code}")
                         
                 except httpx.TimeoutException as e:

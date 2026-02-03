@@ -12,11 +12,18 @@ llm:
                         # Higher values allow longer job descriptions but use more VRAM
                         # GTX 1080 (8GB) can comfortably handle 8192-16384
   
-  # Ollama Restart/Retry Configuration (optional)
-  # Handles GPU loss and 502 errors by restarting Ollama automatically
-  # restart_url: "http://localhost:8080/restart"  # URL to POST for restarting Ollama service
-  # restart_wait_seconds: 10  # Seconds to wait after restart before retry
-  # retry_attempts: 1  # Number of retry attempts with restart on LLM failures
+  # LLM Service Restart/Retry Configuration (optional)
+  # Automatically restarts the LLM service on failures (e.g., GPU loss, 502 errors)
+  # Uncomment and configure these parameters to enable restart functionality
+  # restart_url: "http://localhost:8080/restart"  # URL for service restart endpoint
+  # restart_method: "POST"  # HTTP method for restart request (default: POST)
+  # restart_headers:  # HTTP headers for restart request (default shown below)
+  #   Content-Type: "application/json"
+  # restart_payload:  # JSON payload for restart request (customize as needed)
+  #   action: "restart"
+  #   mode: "replace"
+  # restart_wait_seconds: 10  # Seconds to wait after restart before retry (default: 10)
+  # retry_attempts: 1  # Number of retry attempts with restart on failures (default: 1)
 
 # Geographic Targeting
 #
