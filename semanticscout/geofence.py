@@ -14,14 +14,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple
 
-import httpx
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
 from .config import LocationConfig, LLMConfig
 from .database import Job
-from .llm_utils import retry_with_restart
+from .llm_utils import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +117,11 @@ class Geofencer:
         self.llm_geocode_fallback = config.llm_geocode_fallback
         self.llm_geocode_queries = config.llm_geocode_queries
         self.llm_geocode_min_agreement = config.llm_geocode_min_agreement
+        
+        # Initialize LLM client if configured
+        self._llm_client: Optional[LLMClient] = None
+        if llm_config and self.llm_geocode_fallback:
+            self._llm_client = LLMClient(llm_config)
         
         # Initialize geocoder with a reasonable timeout
         self.geocoder = Nominatim(
@@ -330,7 +334,7 @@ class Geofencer:
         Uses consensus voting: queries the LLM multiple times and only
         accepts a result if there's sufficient agreement.
         
-        Includes automatic retry with service restart on failures.
+        Each individual LLM call includes automatic retry with service restart.
         
         Args:
             location_str: The ambiguous location string.
@@ -343,54 +347,31 @@ class Geofencer:
         if cache_key in self._llm_location_cache:
             return self._llm_location_cache[cache_key]
         
-        if not self.llm_config:
+        if not self.llm_config or not self._llm_client:
             return None
         
-        # Retry logic with service restart
-        max_attempts = 1 + self.llm_config.retry_attempts
+        result = await self._query_llm_for_location(location_str)
         
-        for attempt in range(max_attempts):
-            try:
-                result = await self._query_llm_for_location(location_str)
-                
-                # Cache and return result (even if None)
-                self._llm_location_cache[cache_key] = result
-                return result
-                
-            except Exception as e:
-                logger.error(f"LLM location resolution error (attempt {attempt + 1}/{max_attempts}): {e}")
-                
-                # If this was the last attempt, cache None and return
-                if attempt == max_attempts - 1:
-                    self._llm_location_cache[cache_key] = None
-                    return None
-                
-                # Restart service and retry
-                if self.llm_config.restart_url:
-                    logger.info(f"Attempting service restart before retry {attempt + 2}/{max_attempts}")
-                    from .llm_utils import restart_llm_service
-                    await restart_llm_service(self.llm_config)
-                else:
-                    logger.info(f"No restart_url configured, retrying without restart")
-                    # Brief delay before retry even without restart
-                    await asyncio.sleep(2)
-        
-        self._llm_location_cache[cache_key] = None
-        return None
+        # Cache and return result (even if None)
+        self._llm_location_cache[cache_key] = result
+        return result
     
     async def _query_llm_for_location(self, location_str: str) -> Optional[str]:
         """
         Query LLM multiple times to resolve location with consensus.
+        
+        Each individual query uses generate_with_retry for automatic
+        retry with service restart on failures.
         
         Args:
             location_str: The ambiguous location string.
         
         Returns:
             Resolved "City, State" string or None if no consensus.
-            
-        Raises:
-            Exception: If LLM queries fail (e.g., timeout, 502 error).
         """
+        if not self._llm_client:
+            return None
+        
         prompt = (
             f'What is the best City, State assignment for "{location_str}"? '
             'Your answer must be strictly in the form of "City, State" and should not '
@@ -399,48 +380,27 @@ class Geofencer:
         )
         
         responses = []
-        last_error = None
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for i in range(self.llm_geocode_queries):
-                try:
-                    response = await client.post(
-                        f"{self.llm_config.base_url}/api/generate",
-                        json={
-                            "model": self.llm_config.model,
-                            "prompt": prompt,
-                            "stream": False,
-                            "options": {
-                                "temperature": 0.7,  # Higher temp for diversity
-                                "num_predict": 50,
-                            }
-                        }
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        raw_response = result.get("response", "").strip()
-                        
-                        # Clean and validate the response
-                        cleaned = self._parse_llm_location_response(raw_response)
-                        if cleaned:
-                            responses.append(cleaned)
-                            logger.debug(f"LLM query {i+1}: '{location_str}' -> '{cleaned}'")
-                    else:
-                        # Track API errors (like 502) to potentially trigger restart
-                        last_error = Exception(f"LLM API error: {response.status_code}")
-                        logger.debug(f"LLM query {i+1} failed: {response.status_code}")
-                        
-                except httpx.TimeoutException as e:
-                    last_error = e
-                    logger.debug(f"LLM query {i+1} timed out")
-                except Exception as e:
-                    last_error = e
-                    logger.debug(f"LLM query {i+1} failed: {e}")
-        
-        # If we got no valid responses and had errors, raise to trigger retry
-        if not responses and last_error:
-            raise last_error
+        for i in range(self.llm_geocode_queries):
+            # Use generate_with_retry for automatic retry with service restart
+            result = await self._llm_client.generate_with_retry(
+                prompt=prompt,
+                operation_name=f"Location resolution query {i+1}/{self.llm_geocode_queries} for '{location_str}'",
+                temperature=0.7,  # Higher temp for diversity
+                max_tokens=50,
+                context_window=None,  # Use minimal context for this simple query
+            )
+            
+            if result.success:
+                raw_response = result.response_text.strip()
+                
+                # Clean and validate the response
+                cleaned = self._parse_llm_location_response(raw_response)
+                if cleaned:
+                    responses.append(cleaned)
+                    logger.debug(f"LLM query {i+1}: '{location_str}' -> '{cleaned}'")
+            else:
+                logger.debug(f"LLM query {i+1} failed after retries: {result.error}")
         
         if not responses:
             logger.warning(f"No valid LLM responses for location: {location_str}")
@@ -872,3 +832,8 @@ class Geofencer:
         """Clear the geocoding cache."""
         self._geocode_cache.clear()
         logger.debug("Geocoding cache cleared")
+    
+    async def close(self) -> None:
+        """Close resources including the LLM client."""
+        if self._llm_client:
+            await self._llm_client.close()

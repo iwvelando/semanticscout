@@ -1,11 +1,13 @@
 """
 Shared LLM utilities for Semantic Scout.
 
-Provides common retry logic and service restart functionality for LLM interactions.
+Provides common retry logic, service restart functionality, and a centralized
+LLM client for all LLM interactions via Ollama.
 """
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Callable, TypeVar, Optional
 
 import httpx
@@ -15,6 +17,208 @@ from .config import LLMConfig
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
+
+
+@dataclass
+class LLMResponse:
+    """Result of an LLM API call."""
+    success: bool
+    response_text: str
+    raw_response: dict
+    error: Optional[str] = None
+
+
+class LLMClient:
+    """
+    Centralized client for LLM interactions via Ollama.
+    
+    Handles URL normalization, HTTP client management, error handling,
+    and automatic retry with service restart on failures.
+    """
+    
+    def __init__(self, llm_config: LLMConfig):
+        """
+        Initialize the LLM client.
+        
+        Args:
+            llm_config: LLM configuration.
+        """
+        self.config = llm_config
+        # Normalize base URL - remove trailing slash to prevent double-slash issues
+        self.base_url = llm_config.base_url.rstrip('/')
+        self.model = llm_config.model
+        
+        # HTTP client with configurable timeout
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(llm_config.timeout, connect=10.0)
+        )
+        
+        logger.debug(f"LLM client initialized: base_url={self.base_url}, model={self.model}")
+    
+    async def check_available(self) -> bool:
+        """
+        Check if Ollama is available and responding.
+        
+        Returns:
+            True if Ollama is available.
+        """
+        try:
+            response = await self.client.get(f"{self.base_url}/api/tags")
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Ollama availability check failed: {e}")
+            return False
+    
+    async def check_model_available(self) -> bool:
+        """
+        Check if the configured model is available in Ollama.
+        
+        Returns:
+            True if the model is available.
+        """
+        try:
+            response = await self.client.get(f"{self.base_url}/api/tags")
+            if response.status_code != 200:
+                return False
+            
+            data = response.json()
+            models = [m.get("name", "") for m in data.get("models", [])]
+            
+            # Check for exact match or model without tag
+            model_base = self.model.split(":")[0]
+            for m in models:
+                if m == self.model or m.startswith(model_base):
+                    return True
+            
+            logger.warning(f"Model '{self.model}' not found. Available models: {models}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Model availability check failed: {e}")
+            return False
+    
+    async def generate(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        context_window: Optional[int] = None,
+    ) -> LLMResponse:
+        """
+        Generate a response from the LLM.
+        
+        Args:
+            prompt: The prompt to send to the LLM.
+            temperature: Override the default temperature.
+            max_tokens: Override the default max tokens (num_predict).
+            context_window: Override the default context window (num_ctx).
+        
+        Returns:
+            LLMResponse with the result.
+        """
+        options = {
+            "temperature": temperature if temperature is not None else self.config.temperature,
+            "num_predict": max_tokens if max_tokens is not None else self.config.max_tokens,
+        }
+        
+        # Only include context_window if specified or configured
+        ctx = context_window if context_window is not None else self.config.context_window
+        if ctx:
+            options["num_ctx"] = ctx
+        
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": options
+                }
+            )
+            
+            if response.status_code != 200:
+                error_msg = f"Ollama API error: {response.status_code}"
+                logger.error(error_msg)
+                return LLMResponse(
+                    success=False,
+                    response_text="",
+                    raw_response={},
+                    error=error_msg
+                )
+            
+            result = response.json()
+            response_text = result.get("response", "")
+            
+            return LLMResponse(
+                success=True,
+                response_text=response_text,
+                raw_response=result
+            )
+            
+        except httpx.TimeoutException:
+            error_msg = "Ollama request timed out"
+            logger.error(error_msg)
+            return LLMResponse(
+                success=False,
+                response_text="",
+                raw_response={},
+                error=error_msg
+            )
+        except httpx.ConnectError:
+            error_msg = f"Could not connect to Ollama at {self.base_url}"
+            logger.error(error_msg)
+            return LLMResponse(
+                success=False,
+                response_text="",
+                raw_response={},
+                error=error_msg
+            )
+        except Exception as e:
+            error_msg = f"Unexpected error during LLM request: {e}"
+            logger.error(error_msg)
+            return LLMResponse(
+                success=False,
+                response_text="",
+                raw_response={},
+                error=error_msg
+            )
+    
+    async def generate_with_retry(
+        self,
+        prompt: str,
+        operation_name: str = "LLM request",
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        context_window: Optional[int] = None,
+    ) -> LLMResponse:
+        """
+        Generate a response with automatic retry and service restart on failure.
+        
+        Args:
+            prompt: The prompt to send to the LLM.
+            operation_name: Human-readable name for logging.
+            temperature: Override the default temperature.
+            max_tokens: Override the default max tokens.
+            context_window: Override the default context window.
+        
+        Returns:
+            LLMResponse with the result.
+        """
+        return await retry_with_restart(
+            operation=lambda: self.generate(
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                context_window=context_window,
+            ),
+            llm_config=self.config,
+            operation_name=operation_name
+        )
+    
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        await self.client.aclose()
 
 
 async def restart_llm_service(llm_config: LLMConfig) -> bool:

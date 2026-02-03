@@ -306,6 +306,7 @@ class SemanticScoutPipeline:
             # Cleanup
             await self.collector_manager.close()
             await self.scorer_manager.close()
+            await self.geofencer.close()
         
         stats["end_time"] = datetime.now()
         stats["duration"] = (stats["end_time"] - stats["start_time"]).total_seconds()
@@ -373,6 +374,7 @@ class SemanticScoutPipeline:
             
         finally:
             await self.scorer_manager.close()
+            await self.geofencer.close()
         
         return stats
     

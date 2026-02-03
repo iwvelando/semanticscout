@@ -12,11 +12,9 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-import httpx
-
 from .config import LLMConfig, SearchConfig
 from .database import Job
-from .llm_utils import retry_with_restart
+from .llm_utils import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +47,11 @@ class SemanticScorer:
         """
         self.llm_config = llm_config
         self.job_goal = search_config.job_goal_statement
-        self.base_url = llm_config.base_url.rstrip('/')
-        self.model = llm_config.model
         
-        # HTTP client with timeout
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(llm_config.timeout, connect=10.0)
-        )
+        # Use centralized LLM client
+        self._llm_client = LLMClient(llm_config)
         
-        logger.info(f"Semantic scorer initialized with model: {self.model}")
+        logger.info(f"Semantic scorer initialized with model: {llm_config.model}")
     
     def _build_scoring_prompt(self, job: Job) -> str:
         """
@@ -112,12 +106,7 @@ Do not include any other text outside the JSON object."""
         Returns:
             True if Ollama is available.
         """
-        try:
-            response = await self.client.get(f"{self.base_url}/api/tags")
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Ollama availability check failed: {e}")
-            return False
+        return await self._llm_client.check_available()
     
     async def check_model_available(self) -> bool:
         """
@@ -126,26 +115,7 @@ Do not include any other text outside the JSON object."""
         Returns:
             True if the model is available.
         """
-        try:
-            response = await self.client.get(f"{self.base_url}/api/tags")
-            if response.status_code != 200:
-                return False
-            
-            data = response.json()
-            models = [m.get("name", "") for m in data.get("models", [])]
-            
-            # Check for exact match or model without tag
-            model_base = self.model.split(":")[0]
-            for m in models:
-                if m == self.model or m.startswith(model_base):
-                    return True
-            
-            logger.warning(f"Model '{self.model}' not found. Available models: {models}")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Model availability check failed: {e}")
-            return False
+        return await self._llm_client.check_model_available()
     
     async def score_job(self, job: Job) -> ScoringResult:
         """
@@ -160,86 +130,25 @@ Do not include any other text outside the JSON object."""
         Returns:
             ScoringResult with the score and reasoning.
         """
-        return await retry_with_restart(
-            operation=lambda: self._attempt_score_job(job),
-            llm_config=self.llm_config,
-            operation_name=f"Job '{job.title}' scoring"
-        )
-    
-    async def _attempt_score_job(self, job: Job) -> ScoringResult:
-        """
-        Single attempt to score a job (internal method).
-        
-        Args:
-            job: The job to score.
-        
-        Returns:
-            ScoringResult with the score and reasoning.
-        """
         prompt = self._build_scoring_prompt(job)
         
-        try:
-            response = await self.client.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.llm_config.temperature,
-                        "num_predict": self.llm_config.max_tokens,
-                        "num_ctx": self.llm_config.context_window,
-                    }
-                }
-            )
-            
-            if response.status_code != 200:
-                error_msg = f"Ollama API error: {response.status_code}"
-                logger.error(error_msg)
-                return ScoringResult(
-                    score=0,
-                    reasoning="",
-                    raw_response=response.text,
-                    success=False,
-                    error=error_msg
-                )
-            
-            result = response.json()
-            raw_response = result.get("response", "")
-            
-            # Parse the JSON response
-            return self._parse_scoring_response(raw_response)
-            
-        except httpx.TimeoutException:
-            error_msg = "Ollama request timed out"
-            logger.error(error_msg)
+        # Use generate_with_retry for automatic retry with service restart
+        result = await self._llm_client.generate_with_retry(
+            prompt=prompt,
+            operation_name=f"Job '{job.title}' scoring"
+        )
+        
+        if not result.success:
             return ScoringResult(
                 score=0,
                 reasoning="",
-                raw_response="",
+                raw_response=result.response_text,
                 success=False,
-                error=error_msg
+                error=result.error
             )
-        except httpx.ConnectError:
-            error_msg = f"Could not connect to Ollama at {self.base_url}"
-            logger.error(error_msg)
-            return ScoringResult(
-                score=0,
-                reasoning="",
-                raw_response="",
-                success=False,
-                error=error_msg
-            )
-        except Exception as e:
-            error_msg = f"Unexpected error during scoring: {e}"
-            logger.error(error_msg)
-            return ScoringResult(
-                score=0,
-                reasoning="",
-                raw_response="",
-                success=False,
-                error=error_msg
-            )
+        
+        # Parse the JSON response
+        return self._parse_scoring_response(result.response_text)
     
     def _parse_scoring_response(self, response: str) -> ScoringResult:
         """
@@ -319,7 +228,7 @@ Do not include any other text outside the JSON object."""
     async def score_jobs(
         self, 
         jobs: list[Job], 
-        max_concurrent: int = 2,
+        max_concurrent: int = 1,
         delay_between: float = 1.0
     ) -> list[tuple[Job, ScoringResult]]:
         """
@@ -360,8 +269,8 @@ Do not include any other text outside the JSON object."""
         return results
     
     async def close(self) -> None:
-        """Close the HTTP client."""
-        await self.client.aclose()
+        """Close the LLM client."""
+        await self._llm_client.close()
 
 
 class ScorerManager:
