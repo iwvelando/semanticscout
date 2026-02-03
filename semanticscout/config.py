@@ -238,6 +238,12 @@ def load_config(config_path: Optional[str] = None) -> Config:
             temperature=llm_data.get("temperature", config.llm.temperature),
             max_tokens=llm_data.get("max_tokens", config.llm.max_tokens),
             context_window=llm_data.get("context_window", config.llm.context_window),
+            restart_url=llm_data.get("restart_url", config.llm.restart_url),
+            restart_method=llm_data.get("restart_method", config.llm.restart_method),
+            restart_headers=llm_data.get("restart_headers", config.llm.restart_headers),
+            restart_payload=llm_data.get("restart_payload", config.llm.restart_payload),
+            restart_wait_seconds=llm_data.get("restart_wait_seconds", config.llm.restart_wait_seconds),
+            retry_attempts=llm_data.get("retry_attempts", config.llm.retry_attempts),
         )
     
     # Load location config
