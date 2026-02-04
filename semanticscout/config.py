@@ -21,6 +21,7 @@ class LLMConfig:
     temperature: float = 0.3
     max_tokens: int = 500  # Output token limit (num_predict)
     context_window: int = 8192  # Total context window (num_ctx) for input + output
+    max_concurrent_requests: int = 1  # Maximum concurrent LLM requests (set to 1 for OLLAMA_NUM_PARALLEL=1)
     # LLM service restart/retry configuration
     restart_url: Optional[str] = None  # URL for restarting the LLM service (e.g., http://localhost:8080/restart)
     restart_method: str = "POST"  # HTTP method for restart request
@@ -238,6 +239,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
             temperature=llm_data.get("temperature", config.llm.temperature),
             max_tokens=llm_data.get("max_tokens", config.llm.max_tokens),
             context_window=llm_data.get("context_window", config.llm.context_window),
+            max_concurrent_requests=llm_data.get("max_concurrent_requests", config.llm.max_concurrent_requests),
             restart_url=llm_data.get("restart_url", config.llm.restart_url),
             restart_method=llm_data.get("restart_method", config.llm.restart_method),
             restart_headers=llm_data.get("restart_headers", config.llm.restart_headers),

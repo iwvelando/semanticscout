@@ -259,7 +259,7 @@ class SemanticScoutPipeline:
                 if await self.scorer_manager.initialize():
                     results = await self.scorer_manager.score_jobs(
                         jobs_to_score,
-                        max_concurrent=2
+                        max_concurrent=self.config.llm.max_concurrent_requests
                     )
                     
                     for job, result in results:

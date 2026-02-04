@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
+# Global restart coordination to prevent concurrent requests during restart
+_restart_lock = asyncio.Lock()
+_restart_complete_event: Optional[asyncio.Event] = None
+
 
 @dataclass
 class LLMResponse:
@@ -225,47 +229,89 @@ async def restart_llm_service(llm_config: LLMConfig) -> bool:
     """
     Restart LLM service by making a configurable HTTP request.
     
+    This function coordinates restarts globally so that:
+    1. Only one restart is triggered even if multiple tasks fail simultaneously
+    2. All concurrent tasks wait for the restart to complete before retrying
+    
     Args:
         llm_config: LLM configuration containing restart parameters.
     
     Returns:
-        True if restart request succeeded, False otherwise.
+        True if restart request succeeded (or was already in progress), False otherwise.
     """
+    global _restart_complete_event
+    
     if not llm_config.restart_url:
         logger.warning("LLM service restart requested but no restart_url configured")
         return False
     
-    try:
-        logger.info(f"Requesting LLM service restart via {llm_config.restart_url}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Determine HTTP method
-            method = llm_config.restart_method.upper()
+    async with _restart_lock:
+        # Check if another task is already handling the restart
+        if _restart_complete_event is not None and not _restart_complete_event.is_set():
+            logger.debug("Restart already in progress by another task, will wait for completion")
+            event = _restart_complete_event
+            # Release lock and wait
+        else:
+            # We're the first to request a restart - initiate it
+            _restart_complete_event = asyncio.Event()
+            event = _restart_complete_event
             
-            # Prepare request kwargs
-            kwargs = {}
-            if llm_config.restart_payload:
-                kwargs['json'] = llm_config.restart_payload
-            if llm_config.restart_headers:
-                kwargs['headers'] = llm_config.restart_headers
-            
-            # Make the request
-            response = await client.request(
-                method,
-                llm_config.restart_url,
-                **kwargs
-            )
-            
-            if response.status_code in [200, 201, 202, 204]:
-                logger.info(f"LLM service restart initiated, waiting {llm_config.restart_wait_seconds}s for stabilization")
-                await asyncio.sleep(llm_config.restart_wait_seconds)
-                return True
-            else:
-                logger.error(f"LLM service restart failed: {response.status_code} - {response.text}")
+            try:
+                logger.info(f"Requesting LLM service restart via {llm_config.restart_url}")
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    # Determine HTTP method
+                    method = llm_config.restart_method.upper()
+                    
+                    # Prepare request kwargs
+                    kwargs = {}
+                    if llm_config.restart_payload:
+                        kwargs['json'] = llm_config.restart_payload
+                    if llm_config.restart_headers:
+                        kwargs['headers'] = llm_config.restart_headers
+                    
+                    # Make the request
+                    response = await client.request(
+                        method,
+                        llm_config.restart_url,
+                        **kwargs
+                    )
+                    
+                    if response.status_code in [200, 201, 202, 204]:
+                        logger.info(f"LLM service restart initiated, blocking all LLM requests for {llm_config.restart_wait_seconds}s")
+                        # Perform the wait while holding the lock is fine since
+                        # all tasks will wait on the event anyway
+                        await asyncio.sleep(llm_config.restart_wait_seconds)
+                        logger.info("LLM service restart wait complete, resuming requests")
+                        event.set()
+                        return True
+                    else:
+                        logger.error(f"LLM service restart failed: {response.status_code} - {response.text}")
+                        event.set()  # Unblock waiters even on failure
+                        return False
+                        
+            except Exception as e:
+                logger.error(f"Error requesting LLM service restart: {e}")
+                event.set()  # Unblock waiters even on failure
                 return False
-                
-    except Exception as e:
-        logger.error(f"Error requesting LLM service restart: {e}")
-        return False
+    
+    # If we get here, we're waiting for another task's restart to complete
+    logger.debug("Waiting for in-progress LLM restart to complete")
+    await event.wait()
+    logger.debug("LLM restart complete, proceeding")
+    return True
+
+
+async def wait_for_restart_if_needed() -> None:
+    """
+    Wait for any in-progress restart to complete before making a request.
+    
+    This should be called before making LLM API requests to ensure
+    we don't hit the service while it's restarting.
+    """
+    if _restart_complete_event is not None and not _restart_complete_event.is_set():
+        logger.debug("Waiting for in-progress LLM restart to complete before request")
+        await _restart_complete_event.wait()
+        logger.debug("LLM restart complete, proceeding with request")
 
 
 async def retry_with_restart(
@@ -290,6 +336,9 @@ async def retry_with_restart(
     max_attempts = 1 + llm_config.retry_attempts
     
     for attempt in range(max_attempts):
+        # Wait for any in-progress restart to complete before attempting
+        await wait_for_restart_if_needed()
+        
         result = await operation()
         
         # Check if operation succeeded
