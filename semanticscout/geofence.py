@@ -117,6 +117,7 @@ class Geofencer:
         self.llm_geocode_fallback = config.llm_geocode_fallback
         self.llm_geocode_queries = config.llm_geocode_queries
         self.llm_geocode_min_agreement = config.llm_geocode_min_agreement
+        self.llm_geocode_temperature = config.llm_geocode_temperature
         
         # Initialize LLM client if configured
         self._llm_client: Optional[LLMClient] = None
@@ -264,6 +265,13 @@ class Geofencer:
             is_remote=is_remote,
         )
         
+        # If remote is detected, skip geocoding entirely - we don't need coordinates
+        # This prevents unnecessary LLM fallback for strings like "Remote or Foster City, CA"
+        if is_remote:
+            logger.debug(f"Location '{location_str}' detected as remote, skipping geocoding")
+            self._geocode_cache[cache_key] = result
+            return result
+        
         # Clean up location string for geocoding
         clean_location = self._clean_location_string(location_str)
         
@@ -373,10 +381,12 @@ class Geofencer:
             return None
         
         prompt = (
-            f'What is the best City, State assignment for "{location_str}"? '
-            'Your answer must be strictly in the form of "City, State" and should not '
-            'include any other text UNLESS you cannot make an educated best guess in '
-            'which case your answer is to be "Unknown"'
+            'Consider only real cities that are known to exist on Earth in the present day. '
+            'I will provide you with an input text string. IF you have confidence that it refers '
+            'to a physical location, and you have confidence in what that location is, then your '
+            'output is STRICTLY the best City, State assignment for that input, and your answer '
+            'MUST be in the form of "City, State" WITH NO OTHER TEXT. In ALL OTHER CASES your '
+            f'answer is to be "Unknown". INPUT TEXT: "{location_str}"'
         )
         
         responses = []
@@ -386,7 +396,7 @@ class Geofencer:
             result = await self._llm_client.generate_with_retry(
                 prompt=prompt,
                 operation_name=f"Location resolution query {i+1}/{self.llm_geocode_queries} for '{location_str}'",
-                temperature=0.7,  # Higher temp for diversity
+                temperature=self.llm_geocode_temperature,  # Low temperature for consistent results
                 max_tokens=50,
                 context_window=None,  # Use minimal context for this simple query
             )

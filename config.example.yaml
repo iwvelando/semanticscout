@@ -67,6 +67,7 @@ location:
   llm_geocode_fallback: true  # Use LLM to resolve ambiguous location strings
   llm_geocode_queries: 5  # Number of LLM queries for consensus voting
   llm_geocode_min_agreement: 3  # Minimum matching responses needed (out of llm_geocode_queries)
+  llm_geocode_temperature: 0.1  # LLM temperature for geocoding (lower = more consistent results)
 
 # Job Search Parameters
 search:

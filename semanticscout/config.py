@@ -53,6 +53,7 @@ class LocationConfig:
     llm_geocode_fallback: bool = True  # Use LLM to resolve ambiguous locations
     llm_geocode_queries: int = 5  # Number of LLM queries for consensus
     llm_geocode_min_agreement: int = 3  # Minimum agreement for consensus (must be <= queries)
+    llm_geocode_temperature: float = 0.1  # Lower temperature for more consistent geocoding results
     
     @property
     def geo_filtering_enabled(self) -> bool:
@@ -256,7 +257,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         cities: dict[str, CityConfig] = {}
         reserved_keys = {
             "include_remote", "llm_geocode_fallback", 
-            "llm_geocode_queries", "llm_geocode_min_agreement"
+            "llm_geocode_queries", "llm_geocode_min_agreement",
+            "llm_geocode_temperature"
         }
         
         for key, value in loc_data.items():
@@ -277,6 +279,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
             llm_geocode_fallback=loc_data.get("llm_geocode_fallback", config.location.llm_geocode_fallback),
             llm_geocode_queries=loc_data.get("llm_geocode_queries", config.location.llm_geocode_queries),
             llm_geocode_min_agreement=loc_data.get("llm_geocode_min_agreement", config.location.llm_geocode_min_agreement),
+            llm_geocode_temperature=loc_data.get("llm_geocode_temperature", config.location.llm_geocode_temperature),
         )
     
     # Load search config
