@@ -14,6 +14,7 @@ import httpx
 
 from .config import ReportingConfig, SlackConfig
 from .database import Database, Job, ApplicationStatus
+from .pay_parser import extract_pay_range, format_pay_for_report, format_pay_for_slack
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,10 @@ class ReportGenerator:
         Returns:
             List of markdown lines.
         """
+        # Extract pay range from description
+        pay_range = extract_pay_range(job.description) if job.description else None
+        pay_display = format_pay_for_report(pay_range)
+        
         lines = [
             f"### {index}. {job.title}",
             f"",
@@ -187,6 +192,7 @@ class ReportGenerator:
             f"|-------|-------|",
             f"| **Company** | {job.company} |",
             f"| **Location** | {job.location} |",
+            f"| **Pay Range** | {pay_display} |",
             f"| **Score** | **{job.semantic_score:.1f}/10** |",
             f"| **Source** | {job.source.title()} |",
         ]
@@ -891,6 +897,12 @@ class ReportGenerator:
                     details_parts.append(f"📌 {job.matched_city}{distance_str}")
             elif job.distance_miles is not None and not job.is_remote:
                 details_parts.append(f"({job.distance_miles:.1f} mi)")
+            
+            # Add pay range if available
+            pay_range = extract_pay_range(job.description) if job.description else None
+            pay_slack = format_pay_for_slack(pay_range)
+            if pay_slack:
+                details_parts.append(pay_slack)
             
             details_line = " • ".join(details_parts)
             
